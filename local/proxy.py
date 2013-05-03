@@ -2326,7 +2326,7 @@ class goagent():
     def updateappid(self):
         while(1):
             random.shuffle(common.GAE_APPIDS)
-            logging.info("Goagent: Updated APPID List, %sG BW Remaning",str(len(common.GAE_APPIDS)))
+            logging.info('Goagent: %s |Updated APPID List, %sG BW Remaning', common.GAE_APPIDS.pop(0), str(len(common.GAE_APPIDS)))
             common.GAE_FETCHSERVER = '%s://%s.appspot.com%s?' % (common.GOOGLE_MODE, common.GAE_APPIDS[0], common.GAE_PATH)
             gevent.sleep(300)
     def ping(self):
