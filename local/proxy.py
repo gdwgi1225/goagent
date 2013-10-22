@@ -797,12 +797,6 @@ class HTTPUtil(object):
     MessageClass = dict
     protocol_version = 'HTTP/1.1'
     skip_headers = frozenset(['Vary', 'Via', 'X-Forwarded-For', 'Proxy-Authorization', 'Proxy-Connection', 'Upgrade', 'X-Chrome-Variations', 'Connection', 'Cache-Control'])
-    abbv_headers = {'Accept': ('A', lambda x: '*/*' in x),
-                    'Accept-Charset': ('AC', lambda x: x.startswith('UTF-8,')),
-                    'Accept-Language': ('AL', lambda x: x.startswith('zh-CN')),
-                    'Accept-Encoding': ('AE', lambda x: x.startswith('gzip,')), }
-    ssl_has_sni = getattr(ssl, 'HAS_SNI', False)
-    ssl_has_npn = getattr(ssl, 'HAS_NPN', False)
     ssl_validate = False
     ssl_obfuscate = False
     ssl_ciphers = ':'.join(['ECDHE-ECDSA-AES256-SHA',
@@ -859,36 +853,16 @@ class HTTPUtil(object):
         self.proxy = proxy
         self.ssl_validate = ssl_validate or self.ssl_validate
         self.ssl_obfuscate = ssl_obfuscate or self.ssl_obfuscate
-        if sys.version_info[0] == 3:
-            self.ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLSv1)
-            if self.ssl_validate:
-                self.ssl_context.verify_mode = ssl.CERT_REQUIRED
-                self.ssl_context.load_verify_locations('cacert.pem')
-            if self.ssl_obfuscate:
-                self.ssl_ciphers = ':'.join(x for x in self.ssl_ciphers.split(':') if random.random() > 0.5)
-                self.ssl_context.set_ciphers(self.ssl_ciphers)
-            self.wrap_socket = self.ssl_context.wrap_socket
-        else:
+        if self.ssl_validate or self.ssl_obfuscate:
             self.ssl_context = OpenSSL.SSL.Context(OpenSSL.SSL.TLSv1_METHOD)
-            if self.ssl_validate:
-                self.ssl_context.load_verify_locations('cacert.pem')
-            if self.ssl_obfuscate:
-                self.ssl_ciphers = ':'.join(x for x in self.ssl_ciphers.split(':') if random.random() > 0.5)
-                self.ssl_context.set_cipher_list(self.ssl_ciphers)
-            self.wrap_socket = self.pyopenssl_wrap_socket
-
-    def pyopenssl_wrap_socket(self, sock, **kwargs):
-        connection = SSLConnection(self.ssl_context, sock)
-        if kwargs.get('server_side', False):
-            connection.set_accept_state()
         else:
-            connection.set_connect_state()
-        server_hostname = kwargs.get('server_hostname')
-        if server_hostname:
-            connection.set_tlsext_host_name(server_hostname.encode())
-        if kwargs.get('do_handshake_on_connect', True):
-            connection.do_handshake()
-        return connection
+            self.ssl_context = None
+        if self.ssl_validate:
+            self.ssl_context.load_verify_locations(r'cacert.pem')
+            self.ssl_context.set_verify(OpenSSL.SSL.VERIFY_PEER, lambda c, x, e, d, ok: ok)
+        if self.ssl_obfuscate:
+            self.ssl_ciphers = ':'.join(x for x in self.ssl_ciphers.split(':') if random.random() > 0.5)
+            self.ssl_context.set_cipher_list(self.ssl_ciphers)
 
     def dns_resolve(self, host, dnsserver='', ipv4_only=True):
         iplist = self.dns.get(host)
@@ -936,7 +910,7 @@ class HTTPUtil(object):
                     sock.close()
 
         def _close_connection(count, queobj):
-            for i in range(count):
+            for _ in range(count):
                 queobj.get()
         host, port = address
         result = None
@@ -949,13 +923,13 @@ class HTTPUtil(object):
             window = min((self.max_window+1)//2 + i, len(addresses))
             addresses.sort(key=get_connection_time)
             addrs = addresses[:window] + random.sample(addresses, window)
-            queobj = queue.Queue()
+            queobj = Queue.Queue()
             for addr in addrs:
-                threading._start_new_thread(_create_connection, (addr, timeout, queobj))
+                thread.start_new_thread(_create_connection, (addr, timeout, queobj))
             for i in range(len(addrs)):
                 result = queobj.get()
-                if not isinstance(result, (socket.error, ssl.SSLError, OSError)):
-                    threading._start_new_thread(_close_connection, (len(addrs)-i-1, queobj))
+                if not isinstance(result, (socket.error, OSError)):
+                    thread.start_new_thread(_close_connection, (len(addrs)-i-1, queobj))
                     return result
                 else:
                     if i == 0:
@@ -978,8 +952,7 @@ class HTTPUtil(object):
                 # set a short timeout to trigger timeout retry more quickly.
                 sock.settimeout(timeout or self.max_timeout)
                 # pick up the certificate
-                server_hostname = 'www.google.com' if address[0].endswith('.appspot.com') else None
-                ssl_sock = self.wrap_socket(sock, do_handshake_on_connect=False, server_hostname=server_hostname)
+                ssl_sock = ssl.wrap_socket(sock, do_handshake_on_connect=False)
                 ssl_sock.settimeout(timeout or self.max_timeout)
                 # start connection time record
                 start_time = time.time()
@@ -997,12 +970,8 @@ class HTTPUtil(object):
                 ssl_sock.sock = sock
                 # verify SSL certificate.
                 if self.ssl_validate and address[0].endswith('.appspot.com'):
-                    if hasattr(ssl_sock, 'get_peer_certificate'):
-                        cert = ssl_sock.get_peer_certificate()
-                        commonname = next((v for k, v in cert.get_subject().get_components() if k == 'CN'))
-                    elif hasattr(ssl_sock, 'getpeercert'):
-                        cert = ssl_sock.getpeercert()
-                        commonname = next((v for ((k, v),) in cert['subject'] if k == 'commonName'))
+                    cert = ssl_sock.getpeercert()
+                    commonname = next((v for ((k, v),) in cert['subject'] if k == 'commonName'))
                     if '.google' not in commonname and not commonname.endswith('.appspot.com'):
                         raise ssl.SSLError("Host name '%s' doesn't match certificate host '%s'" % (address[0], commonname))
                 # put ssl socket object to output queobj
@@ -1018,24 +987,77 @@ class HTTPUtil(object):
                 # close tcp socket
                 if sock:
                     sock.close()
-
+        def _create_openssl_connection(ipaddr, timeout, queobj):
+            sock = None
+            ssl_sock = None
+            try:
+                # create a ipv4/ipv6 socket object
+                sock = socket.socket(socket.AF_INET if ':' not in ipaddr[0] else socket.AF_INET6)
+                # set reuseaddr option to avoid 10048 socket error
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # resize socket recv buffer 8K->32K to improve browser releated application performance
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32*1024)
+                # disable negal algorithm to send http request quickly.
+                sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, True)
+                # set a short timeout to trigger timeout retry more quickly.
+                sock.settimeout(timeout or self.max_timeout)
+                # pick up the certificate
+                server_hostname = b'www.google.com' if address[0].endswith('.appspot.com') else None
+                ssl_sock = SSLConnection(self.ssl_context, sock)
+                ssl_sock.set_connect_state()
+                if server_hostname:
+                    ssl_sock.set_tlsext_host_name(server_hostname)
+                # start connection time record
+                start_time = time.time()
+                # TCP connect
+                ssl_sock.connect(ipaddr)
+                connected_time = time.time()
+                # SSL handshake
+                ssl_sock.do_handshake()
+                handshaked_time = time.time()
+                # record TCP connection time
+                self.tcp_connection_time[ipaddr] = connected_time - start_time
+                # record SSL connection time
+                self.ssl_connection_time[ipaddr] = handshaked_time - start_time
+                # sometimes, we want to use raw tcp socket directly(select/epoll), so setattr it to ssl socket.
+                ssl_sock.sock = sock
+                # verify SSL certificate.
+                if self.ssl_validate and address[0].endswith('.appspot.com'):
+                    cert = ssl_sock.get_peer_certificate()
+                    commonname = next((v for k, v in cert.get_subject().get_components() if k == 'CN'))
+                    if '.google' not in commonname and not commonname.endswith('.appspot.com'):
+                        raise socket.error("Host name '%s' doesn't match certificate host '%s'" % (address[0], commonname))
+                # put ssl socket object to output queobj
+                queobj.put(ssl_sock)
+            except (socket.error, OpenSSL.SSL.Error, OSError) as e:
+                # any socket.error, put Excpetions to output queobj.
+                queobj.put(e)
+                # reset a large and random timeout to the ipaddr
+                self.ssl_connection_time[ipaddr] = self.max_timeout + random.random()
+                # close ssl socket
+                if ssl_sock:
+                    ssl_sock.close()
+                # close tcp socket
+                if sock:
+                    sock.close()
         def _close_ssl_connection(count, queobj):
-            for i in range(count):
+            for _ in range(count):
                 queobj.get()
         host, port = address
         result = None
+        create_connection = _create_ssl_connection if not self.ssl_obfuscate and not self.ssl_validate else _create_openssl_connection
         addresses = [(x, port) for x in self.dns_resolve(host)]
         for i in range(self.max_retry):
             window = min((self.max_window+1)//2 + i, len(addresses))
             addresses.sort(key=self.ssl_connection_time.__getitem__)
             addrs = addresses[:window] + random.sample(addresses, window)
-            queobj = queue.Queue()
+            queobj = Queue.Queue()
             for addr in addrs:
-                threading._start_new_thread(_create_ssl_connection, (addr, timeout, queobj))
+                thread.start_new_thread(create_connection, (addr, timeout, queobj))
             for i in range(len(addrs)):
                 result = queobj.get()
-                if not isinstance(result, (socket.error, ssl.SSLError, OSError)):
-                    threading._start_new_thread(_close_ssl_connection, (len(addrs)-i-1, queobj))
+                if not isinstance(result, Exception):
+                    thread.start_new_thread(_close_ssl_connection, (len(addrs)-i-1, queobj))
                     return result
                 else:
                     if i == 0:
@@ -1077,27 +1099,27 @@ class HTTPUtil(object):
         assert isinstance(proxy, str)
         host, port = address
         logging.debug('create_connection_withproxy connect (%r, %r)', host, port)
-        scheme, username, password, address = ProxyUtil.parse_proxy(proxy or self.proxy)
+        _, username, password, address = ProxyUtil.parse_proxy(proxy or self.proxy)
         try:
             try:
                 self.dns_resolve(host)
-            except (socket.error, ssl.SSLError, OSError):
+            except (socket.error, OSError):
                 pass
             proxyhost, _, proxyport = address.rpartition(':')
             sock = socket.create_connection((proxyhost, int(proxyport)))
             hostname = random.choice(self.dns.get(host) or [host if not host.endswith('.appspot.com') else 'www.google.com'])
             request_data = 'CONNECT %s:%s HTTP/1.1\r\n' % (hostname, port)
             if username and password:
-                request_data += 'Proxy-authorization: Basic %s\r\n' % base64.b64encode(('%s:%s' % (username, password)).encode()).strip().decode()
+                request_data += 'Proxy-authorization: Basic %s\r\n' % base64.b64encode(('%s:%s' % (username, password)).encode()).decode().strip()
             request_data += '\r\n'
             sock.sendall(request_data)
-            response = http.client.HTTPResponse(sock)
+            response = httplib.HTTPResponse(sock)
             response.begin()
             if response.status >= 400:
                 logging.error('create_connection_withproxy return http error code %s', response.status)
                 sock = None
             return sock
-        except (socket.error, ssl.SSLError, OSError) as e:
+        except Exception as e:
             logging.error('create_connection_withproxy error %s', e)
             raise
 
@@ -1134,7 +1156,7 @@ class HTTPUtil(object):
                                 timecount = maxping or timeout
                         else:
                             return
-        except (socket.error, ssl.SSLError, OSError) as e:
+        except NetWorkIOError as e:
             if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET, errno.ENOTCONN, errno.EPIPE):
                 raise
         finally:
@@ -1155,7 +1177,7 @@ class HTTPUtil(object):
                     if bitmask:
                         data = ''.join(chr(ord(x) ^ bitmask) for x in data)
                     dest.sendall(data)
-            except (socket.error, ssl.SSLError, OSError) as e:
+            except NetWorkIOError as e:
                 if e.args[0] not in ('timed out', errno.ECONNABORTED, errno.ECONNRESET, errno.EBADF, errno.EPIPE, errno.ENOTCONN, errno.ETIMEDOUT):
                     raise
             finally:
@@ -1163,7 +1185,7 @@ class HTTPUtil(object):
                     local.close()
                 if remote:
                     remote.close()
-        threading._start_new_thread(io_copy, (remote.dup(), local.dup()))
+        thread.start_new_thread(io_copy, (remote.dup(), local.dup()))
         io_copy(local, remote)
 
     def _request(self, sock, method, path, protocol_version, headers, payload, bufsize=8192, crlf=None, return_sock=None):
@@ -1180,13 +1202,13 @@ class HTTPUtil(object):
         if self.proxy:
             _, username, password, _ = ProxyUtil.parse_proxy(self.proxy)
             if username and password:
-                request_data += 'Proxy-Authorization: Basic %s\r\n' % base64.b64encode('%s:%s' % (username, password))
+                request_data += 'Proxy-Authorization: Basic %s\r\n' % base64.b64encode(('%s:%s' % (username, password)).encode()).decode().strip()
         request_data += '\r\n'
 
         if isinstance(payload, bytes):
             sock.sendall(request_data.encode() + payload)
         elif hasattr(payload, 'read'):
-            sock.sendall(request_data.encode())
+            sock.sendall(request_data)
             while 1:
                 data = payload.read(bufsize)
                 if not data:
@@ -1197,7 +1219,7 @@ class HTTPUtil(object):
 
         if need_crlf:
             try:
-                response = http.client.HTTPResponse(sock)
+                response = httplib.HTTPResponse(sock)
                 response.begin()
                 response.read()
             except Exception:
@@ -1207,15 +1229,15 @@ class HTTPUtil(object):
         if return_sock:
             return sock
 
-        response = http.client.HTTPResponse(sock)
+        response = httplib.HTTPResponse(sock)
         try:
             response.begin()
-        except http.client.BadStatusLine:
+        except httplib.BadStatusLine:
             response = None
         return response
 
     def request(self, method, url, payload=None, headers={}, realhost='', fullurl=False, bufsize=8192, crlf=None, return_sock=None):
-        scheme, netloc, path, params, query, fragment = urllib.parse.urlparse(url)
+        scheme, netloc, path, _, query, _ = urlparse.urlparse(url)
         if netloc.rfind(':') <= netloc.rfind(']'):
             # no port number
             host = netloc
@@ -1247,7 +1269,9 @@ class HTTPUtil(object):
                     path = url
                     #crlf = self.crlf = 0
                     if scheme == 'https':
-                        sock = ssl.wrap_socket(sock, ssl_version=ssl.PROTOCOL_TLSv1)
+                        sock = SSLConnection(self.ssl_context, sock)
+                        sock.set_connect_state()
+                        sock.do_handshake()
                 if sock:
                     if scheme == 'https':
                         crlf = 0
