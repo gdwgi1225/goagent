@@ -17,18 +17,22 @@
 #      Felix Yan      <felixonmars@gmail.com>
 #      Mort Yao       <mort.yao@gmail.com>
 #      Wang Wei Qiang <wwqgtxx@gmail.com>
+#      Poly Rabbit    <mcx_221@foxmail.com>
 
-__version__ = '2.2.0'
+__version__ = '3.0.5'
 
 import sys
 import os
 import glob
 
-sys.version_info[0] == 2 and reload(sys).setdefaultencoding('utf-8')
 sys.path += glob.glob('%s/*.egg' % os.path.dirname(os.path.abspath(__file__)))
 
 try:
     import gevent
+    import gevent.socket
+    import gevent.server
+    import gevent.queue
+    import gevent.event
     import gevent.monkey
     gevent.monkey.patch_all()
 except (ImportError, SystemError):
@@ -42,51 +46,36 @@ import zlib
 import functools
 import re
 import io
-import copy
 import fnmatch
 import traceback
 import random
 import base64
+import string
 import hashlib
 import threading
+import thread
 import socket
 import ssl
 import select
-try:
-    import queue
-except ImportError:
-    import Queue as queue
-try:
-    import socketserver
-except ImportError:
-    import SocketServer as socketserver
-try:
-    import configparser
-except ImportError:
-    import ConfigParser as configparser
-try:
-    import http.server
-    import http.client
-except ImportError:
-    http = type(sys)('http')
-    http.server = __import__('BaseHTTPServer')
-    http.client = __import__('httplib')
-    http.client.parse_headers = http.client.HTTPMessage
-try:
-    import urllib.request
-    import urllib.parse
-except ImportError:
-    import urllib
-    urllib.request = __import__('urllib2')
-    urllib.parse = __import__('urlparse')
-try:
-    import ctypes
-except ImportError:
-    ctypes = None
+import Queue
+import SocketServer
+import ConfigParser
+import BaseHTTPServer
+import httplib
+import urllib2
+import urlparse
 try:
     import OpenSSL
 except ImportError:
     OpenSSL = None
+try:
+    import dnslib
+except ImportError:
+    dnslib = None
+
+
+HAS_PYPY = hasattr(sys, 'pypy_version_info')
+NetWorkIOError = (socket.error, ssl.SSLError, OSError) if not OpenSSL else (socket.error, ssl.SSLError, OpenSSL.SSL.Error, OSError)
 
 
 class Logging(type(sys)):
@@ -101,24 +90,24 @@ class Logging(type(sys)):
 
     def __init__(self, *args, **kwargs):
         self.level = self.__class__.INFO
-        if self.level > self.__class__.DEBUG:
-            self.debug = self.dummy
-        self.__write = __write = sys.stderr.write
-        self.isatty = getattr(sys.stderr, 'isatty', lambda: False)()
         self.__set_error_color = lambda: None
         self.__set_warning_color = lambda: None
+        self.__set_debug_color = lambda: None
         self.__reset_color = lambda: None
-        if self.isatty:
+        if hasattr(sys.stderr, 'isatty') and sys.stderr.isatty():
             if os.name == 'nt':
+                import ctypes
                 SetConsoleTextAttribute = ctypes.windll.kernel32.SetConsoleTextAttribute
                 GetStdHandle = ctypes.windll.kernel32.GetStdHandle
                 self.__set_error_color = lambda: SetConsoleTextAttribute(GetStdHandle(-11), 0x04)
                 self.__set_warning_color = lambda: SetConsoleTextAttribute(GetStdHandle(-11), 0x06)
+                self.__set_debug_color = lambda: SetConsoleTextAttribute(GetStdHandle(-11), 0x002)
                 self.__reset_color = lambda: SetConsoleTextAttribute(GetStdHandle(-11), 0x07)
             elif os.name == 'posix':
-                self.__set_error_color = lambda: __write('\033[31m')
-                self.__set_warning_color = lambda: __write('\033[33m')
-                self.__reset_color = lambda: __write('\033[0m')
+                self.__set_error_color = lambda: sys.stderr.write('\033[31m')
+                self.__set_warning_color = lambda: sys.stderr.write('\033[33m')
+                self.__set_debug_color = lambda: sys.stderr.write('\033[32m')
+                self.__reset_color = lambda: sys.stderr.write('\033[0m')
 
     @classmethod
     def getLogger(cls, *args, **kwargs):
@@ -130,13 +119,15 @@ class Logging(type(sys)):
             self.debug = self.dummy
 
     def log(self, level, fmt, *args, **kwargs):
-        self.__write('%s - [%s] %s\n' % (level, time.ctime()[4:-5], fmt % args))
+        sys.stderr.write('%s - [%s] %s\n' % (level, time.ctime()[4:-5], fmt % args))
 
     def dummy(self, *args, **kwargs):
         pass
 
     def debug(self, fmt, *args, **kwargs):
+        self.__set_debug_color()
         self.log('DEBUG', fmt, *args, **kwargs)
+        self.__reset_color()
 
     def info(self, fmt, *args, **kwargs):
         self.log('INFO', fmt, *args)
@@ -208,7 +199,7 @@ class CertUtil(object):
             fp.write(OpenSSL.crypto.dump_privatekey(OpenSSL.crypto.FILETYPE_PEM, key))
 
     @staticmethod
-    def _get_cert(commonname, sans=[]):
+    def _get_cert(commonname, sans=()):
         with open(CertUtil.ca_keyfile, 'rb') as fp:
             content = fp.read()
             key = OpenSSL.crypto.load_privatekey(OpenSSL.crypto.FILETYPE_PEM, content)
@@ -260,7 +251,7 @@ class CertUtil(object):
         return certfile
 
     @staticmethod
-    def get_cert(commonname, sans=[]):
+    def get_cert(commonname, sans=()):
         if commonname.count('.') >= 2 and len(commonname.split('.')[-2]) > 4:
             commonname = '.'+commonname.partition('.')[-1]
         certfile = os.path.join(CertUtil.ca_certdir, commonname + '.crt')
@@ -276,8 +267,7 @@ class CertUtil(object):
 
     @staticmethod
     def import_ca(certfile):
-        dirname, basename = os.path.split(certfile)
-        commonname = os.path.splitext(certfile)[0]
+        commonname = os.path.splitext(os.path.basename(certfile))[0]
         if OpenSSL:
             try:
                 with open(certfile, 'rb') as fp:
@@ -286,21 +276,20 @@ class CertUtil(object):
             except Exception as e:
                 logging.error('load_certificate(certfile=%r) failed:%s', certfile, e)
         if sys.platform.startswith('win'):
+            import ctypes
             with open(certfile, 'rb') as fp:
                 certdata = fp.read()
                 if certdata.startswith(b'-----'):
                     begin = b'-----BEGIN CERTIFICATE-----'
                     end = b'-----END CERTIFICATE-----'
                     certdata = base64.b64decode(b''.join(certdata[certdata.find(begin)+len(begin):certdata.find(end)].strip().splitlines()))
-                crypt32_handle = ctypes.windll.kernel32.LoadLibraryW(b'crypt32.dll'.decode())
-                crypt32 = ctypes.WinDLL(None, handle=crypt32_handle)
+                crypt32 = ctypes.WinDLL(b'crypt32.dll'.decode())
                 store_handle = crypt32.CertOpenStore(10, 0, 0, 0x4000 | 0x20000, b'ROOT'.decode())
                 if not store_handle:
                     return -1
                 ret = crypt32.CertAddEncodedCertificateToStore(store_handle, 0x1, certdata, len(certdata), 4, None)
                 crypt32.CertCloseStore(store_handle, 0)
                 del crypt32
-                ctypes.windll.kernel32.FreeLibrary(crypt32_handle)
                 return 0 if ret else -1
         elif sys.platform == 'darwin':
             return os.system('security find-certificate -a -c "%s" | grep "%s" >/dev/null || security add-trusted-cert -d -r trustRoot -k "/Library/Keychains/System.keychain" "%s"' % (commonname, commonname, certfile))
@@ -348,18 +337,322 @@ class CertUtil(object):
         if not os.path.exists(certdir):
             os.makedirs(certdir)
 
+gevent_wait_read = gevent.socket.wait_read if 'gevent.socket' in sys.modules else lambda fd,t: select.select([fd], [], [fd], t)
+gevent_wait_write = gevent.socket.wait_write if 'gevent.socket' in sys.modules else lambda fd,t: select.select([], [fd], [fd], t)
+gevent_wait_readwrite = gevent.socket.wait_readwrite if 'gevent.socket' in sys.modules else lambda fd,t: select.select([fd], [fd], [fd], t)
+
+class SSLConnection(object):
+
+    def __init__(self, context, sock):
+        self._context = context
+        self._sock = sock
+        self._connection = OpenSSL.SSL.Connection(context, sock)
+        self._makefile_refs = 0
+
+    def __getattr__(self, attr):
+        if attr not in ('_context', '_sock', '_connection', '_makefile_refs'):
+            return getattr(self._connection, attr)
+
+    def accept(self):
+        sock, addr = self._sock.accept()
+        client = OpenSSL.SSL.Connection(sock._context, sock)
+        return client, addr
+
+    def do_handshake(self):
+        timeout = self._sock.gettimeout()
+        while True:
+            try:
+                self._connection.do_handshake()
+                break
+            except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError, OpenSSL.SSL.WantWriteError):
+                sys.exc_clear()
+                gevent_wait_readwrite(self._sock.fileno(), timeout)
+
+    def connect(self, *args, **kwargs):
+        timeout = self._sock.gettimeout()
+        while True:
+            try:
+                self._connection.connect(*args, **kwargs)
+                break
+            except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
+                sys.exc_clear()
+                gevent_wait_read(self._sock.fileno(), timeout)
+            except OpenSSL.SSL.WantWriteError:
+                sys.exc_clear()
+                gevent_wait_write(self._sock.fileno(), timeout)
+
+    def send(self, data, flags=0):
+        timeout = self._sock.gettimeout()
+        while True:
+            try:
+                self._connection.send(data, flags)
+                break
+            except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
+                sys.exc_clear()
+                gevent_wait_read(self._sock.fileno(), timeout)
+            except OpenSSL.SSL.WantWriteError:
+                sys.exc_clear()
+                gevent_wait_write(self._sock.fileno(), timeout)
+            except OpenSSL.SSL.SysCallError as e:
+                if e[0] == -1 and not data:
+                    # errors when writing empty strings are expected and can be ignored
+                    return 0
+                raise
+
+    def recv(self, bufsiz, flags=0):
+        timeout = self._sock.gettimeout()
+        pending = self._connection.pending()
+        if pending:
+            return self._connection.recv(min(pending, bufsiz))
+        while True:
+            try:
+                return self._connection.recv(bufsiz, flags)
+            except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
+                sys.exc_clear()
+                gevent_wait_read(self._sock.fileno(), timeout)
+            except OpenSSL.SSL.WantWriteError:
+                sys.exc_clear()
+                gevent_wait_write(self._sock.fileno(), timeout)
+            except OpenSSL.SSL.ZeroReturnError:
+                return ''
+
+    def read(self, bufsiz, flags=0):
+        return self.recv(bufsiz, flags)
+
+    def write(self, buf, flags=0):
+        return self.sendall(buf, flags)
+
+    def close(self):
+        if self._makefile_refs < 1:
+            self._connection = None
+            socket.socket.close(self._sock)
+        else:
+            self._makefile_refs -= 1
+
+    def makefile(self, mode='r', bufsize=-1):
+        self._makefile_refs += 1
+        return socket._fileobject(self, mode, bufsize, close=True)
+
+
 
 class ProxyUtil(object):
-    """ProxyUtil module, based on urllib.request"""
+    """ProxyUtil module, based on urllib2"""
 
     @staticmethod
     def parse_proxy(proxy):
-        return urllib.request._parse_proxy(proxy)
+        return urllib2._parse_proxy(proxy)
 
     @staticmethod
     def get_system_proxy():
-        proxies = urllib.request.getproxies()
+        proxies = urllib2.getproxies()
         return proxies.get('https') or proxies.get('http') or {}
+
+    @staticmethod
+    def get_listen_ip():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(('8.8.8.8', 53))
+        listen_ip = sock.getsockname()[0]
+        sock.close()
+        return listen_ip
+
+
+class PacUtil(object):
+    """GoAgent Pac Util"""
+
+    @staticmethod
+    def update_pacfile(filename):
+        listen_ip = ProxyUtil.get_listen_ip() if common.LISTEN_IP in ('', '::', '0.0.0.0') else common.LISTEN_IP
+        autoproxy = '%s:%s' % (listen_ip, common.LISTEN_PORT)
+        blackhole = '%s:%s' % (listen_ip, common.PAC_PORT)
+        default = '%s:%s' % (common.PROXY_HOST, common.PROXY_PORT) if common.PROXY_ENABLE else 'DIRECT'
+        opener = urllib2.build_opener(urllib2.ProxyHandler({'http': autoproxy, 'https': autoproxy}))
+        content = ''
+        need_update = True
+        with open(filename, 'rb') as fp:
+            content = fp.read()
+        try:
+            placeholder = '// AUTO-GENERATED RULES, DO NOT MODIFY!'
+            content = content[:content.index(placeholder)+len(placeholder)]
+            content = re.sub(r'''blackhole\s*=\s*['"]PROXY [\.\w:]+['"]''', 'blackhole = \'PROXY %s\'' % blackhole, content)
+            content = re.sub(r'''autoproxy\s*=\s*['"]PROXY [\.\w:]+['"]''', 'autoproxy = \'PROXY %s\'' % autoproxy, content)
+            if content.startswith('//'):
+                line = '// Proxy Auto-Config file generated by autoproxy2pac, %s\r\n' % time.strftime('%Y-%m-%d %H:%M:%S')
+                content = line + '\r\n'.join(content.splitlines()[1:])
+        except ValueError:
+            need_update = False
+        try:
+            logging.info('try download %r to update_pacfile(%r)', common.PAC_ADBLOCK, filename)
+            adblock_content = opener.open(common.PAC_ADBLOCK).read()
+            logging.info('%r downloaded, try convert it with adblock2pac', common.PAC_ADBLOCK)
+            if 'gevent' in sys.modules and time.sleep is getattr(sys.modules['gevent'], 'sleep', None) and hasattr(gevent.get_hub(), 'threadpool'):
+                jsrule = gevent.get_hub().threadpool.apply(PacUtil.adblock2pac, (adblock_content, 'FindProxyForURLByAdblock', blackhole, default))
+            else:
+                jsrule = PacUtil.adblock2pac(adblock_content, 'FindProxyForURLByAdblock', blackhole, default)
+            content += '\r\n' + jsrule + '\r\n'
+            logging.info('%r downloaded and parsed', common.PAC_ADBLOCK)
+        except Exception as e:
+            need_update = False
+            logging.exception('update_pacfile failed: %r', e)
+        try:
+            logging.info('try download %r to update_pacfile(%r)', common.PAC_GFWLIST, filename)
+            autoproxy_content = base64.b64decode(opener.open(common.PAC_GFWLIST).read())
+            logging.info('%r downloaded, try convert it with autoproxy2pac', common.PAC_GFWLIST)
+            if 'gevent' in sys.modules and time.sleep is getattr(sys.modules['gevent'], 'sleep', None) and hasattr(gevent.get_hub(), 'threadpool'):
+                jsrule = gevent.get_hub().threadpool.apply(PacUtil.autoproxy2pac, (autoproxy_content, 'FindProxyForURLByAutoProxy', autoproxy, default))
+            else:
+                jsrule = PacUtil.autoproxy2pac(autoproxy_content, 'FindProxyForURLByAutoProxy', autoproxy, default)
+            content += '\r\n' + jsrule + '\r\n'
+            logging.info('%r downloaded and parsed', common.PAC_GFWLIST)
+        except Exception as e:
+            need_update = False
+            logging.exception('update_pacfile failed: %r', e)
+        if need_update:
+            with open(filename, 'wb') as fp:
+                fp.write(content)
+            logging.info('%r successfully updated', filename)
+
+    @staticmethod
+    def autoproxy2pac(content, func_name='FindProxyForURLByAutoProxy', proxy='127.0.0.1:8087', default='DIRECT', indent=4):
+        """Autoproxy to Pac, based on https://github.com/iamamac/autoproxy2pac"""
+        jsLines = []
+        for line in content.splitlines()[1:]:
+            if line and not line.startswith("!"):
+                use_proxy = True
+                if line.startswith("@@"):
+                    line = line[2:]
+                    use_proxy = False
+                return_proxy = 'PROXY %s' % proxy if use_proxy else default
+                if line.startswith('/') and line.endswith('/'):
+                    jsLine = 'if (/%s/i.test(url)) return "%s";' % (line[1:-1], return_proxy)
+                elif line.startswith('||'):
+                    domain = line[2:].lstrip('.')
+                    if 'host.indexOf(".%s") >= 0' % domain in jsLines[-1] or 'host.indexOf("%s") >= 0' % domain in jsLines[-1]:
+                        jsLines.pop()
+                    jsLine = 'if (dnsDomainIs(host, ".%s") || host == "%s") return "%s";' % (domain, domain, return_proxy)
+                elif line.startswith('|'):
+                    jsLine = 'if (url.indexOf("%s") == 0) return "%s";' % (line[1:], return_proxy)
+                elif '*' in line:
+                    jsLine = 'if (shExpMatch(url, "*%s*")) return "%s";' % (line.strip('*'), return_proxy)
+                elif '/' not in line:
+                    jsLine = 'if (host.indexOf("%s") >= 0) return "%s";' % (line, return_proxy)
+                else:
+                    jsLine = 'if (url.indexOf("%s") >= 0) return "%s";' % (line, return_proxy)
+                jsLine = ' ' * indent + jsLine
+                if use_proxy:
+                    jsLines.append(jsLine)
+                else:
+                    jsLines.insert(0, jsLine)
+        function = 'function %s(url, host) {\r\n%s\r\n%sreturn "%s";\r\n}' % (func_name, '\n'.join(jsLines), ' '*indent, default)
+        return function
+
+    @staticmethod
+    def urlfilter2pac(content, func_name='FindProxyForURLByUrlfilter', proxy='127.0.0.1:8086', default='DIRECT', indent=4):
+        """urlfilter.ini to Pac, based on https://github.com/iamamac/autoproxy2pac"""
+        jsLines = []
+        for line in content[content.index('[exclude]'):].splitlines()[1:]:
+            if line and not line.startswith(';'):
+                use_proxy = True
+                if line.startswith("@@"):
+                    line = line[2:]
+                    use_proxy = False
+                return_proxy = 'PROXY %s' % proxy if use_proxy else default
+                if '*' in line:
+                    jsLine = 'if (shExpMatch(url, "%s")) return "%s";' % (line, return_proxy)
+                else:
+                    jsLine = 'if (url == "%s") return "%s";' % (line, return_proxy)
+                jsLine = ' ' * indent + jsLine
+                if use_proxy:
+                    jsLines.append(jsLine)
+                else:
+                    jsLines.insert(0, jsLine)
+        function = 'function %s(url, host) {\r\n%s\r\n%sreturn "%s";\r\n}' % (func_name, '\n'.join(jsLines), ' '*indent, default)
+        return function
+
+    @staticmethod
+    def adblock2pac(content, func_name='FindProxyForURLByAdblock', proxy='127.0.0.1:8086', default='DIRECT', indent=4):
+        """adblock list to Pac, based on https://github.com/iamamac/autoproxy2pac"""
+        jsLines = []
+        for line in content.splitlines()[1:]:
+            if not line or line.startswith('!') or '##' in line or '#@#' in line:
+                continue
+            use_proxy = True
+            use_start = False
+            use_end = False
+            use_domain = False
+            use_postfix = []
+            if '$' in line:
+                posfixs = line.split('$')[-1].split(',')
+                if any('domain' in x for x in posfixs):
+                    continue
+                if 'image' in posfixs:
+                    use_postfix += ['.jpg', '.gif']
+                elif 'script' in posfixs:
+                    use_postfix += ['.js']
+                else:
+                    continue
+            line = line.split('$')[0]
+            if line.startswith("@@"):
+                line = line[2:]
+                use_proxy = False
+            if '||' == line[:2]:
+                line = line[2:]
+                use_domain = True
+            elif '|' == line[0]:
+                line = line[1:]
+                use_start = True
+            if line[-1] in ('^', '|'):
+                line = line[:-1]
+                use_end = True
+            return_proxy = 'PROXY %s' % proxy if use_proxy else default
+            line = line.replace('^', '*').strip('*')
+            if use_start and use_end:
+                if '*' in line:
+                    jsLine = 'if (shExpMatch(url, "%s")) return "%s";' % (line, return_proxy)
+                else:
+                    jsLine = 'if (url == "%s") return "%s";' % (line, return_proxy)
+            elif use_start:
+                if '*' in line:
+                    if use_postfix:
+                        jsCondition = ' || '.join('shExpMatch(url, "%s*%s")' % (line, x) for x in use_postfix)
+                        jsLine = 'if (%s) return "%s";' % (jsCondition, return_proxy)
+                    else:
+                        jsLine = 'if (shExpMatch(url, "%s*")) return "%s";' % (line, return_proxy)
+                else:
+                    jsLine = 'if (url.indexOf("%s") == 0) return "%s";' % (line, return_proxy)
+            elif use_domain and use_end:
+                if '*' in line:
+                    jsLine = 'if (shExpMatch(host, "%s*")) return "%s";' % (line, return_proxy)
+                else:
+                    jsLine = 'if (host == "%s") return "%s";' % (line, return_proxy)
+            elif use_domain:
+                if line.split('/')[0].count('.') <= 1:
+                    jsLine = 'if (shExpMatch(url, "http://*.%s*")) return "%s";' % (line, return_proxy)
+                else:
+                    if '*' in line:
+                        if use_postfix:
+                            jsCondition = ' || '.join('shExpMatch(url, "http://%s*%s")' % (line, x) for x in use_postfix)
+                            jsLine = 'if (%s) return "%s";' % (jsCondition, return_proxy)
+                        else:
+                            jsLine = 'if (shExpMatch(url, "http://%s*")) return "%s";' % (line, return_proxy)
+                    else:
+                        if use_postfix:
+                            jsCondition = ' || '.join('shExpMatch(url, "http://%s*%s")' % (line, x) for x in use_postfix)
+                            jsLine = 'if (%s) return "%s";' % (jsCondition, return_proxy)
+                        else:
+                            jsLine = 'if (url.indexOf("http://%s") == 0) return "%s";' % (line, return_proxy)
+            else:
+                if use_postfix:
+                    jsCondition = ' || '.join('shExpMatch(url, "*%s*%s")' % (line, x) for x in use_postfix)
+                    jsLine = 'if (%s) return "%s";' % (jsCondition, return_proxy)
+                else:
+                    jsLine = 'if (shExpMatch(url, "*%s*")) return "%s";' % (line, return_proxy)
+            jsLine = ' ' * indent + jsLine
+            if use_proxy:
+                jsLines.append(jsLine)
+            else:
+                jsLines.insert(0, jsLine)
+        function = 'function %s(url, host) {\r\n%s\r\n%sreturn "%s";\r\n}' % (func_name, '\n'.join(jsLines), ' '*indent, default)
+        return function
 
 
 class DNSUtil(object):
@@ -405,10 +698,12 @@ class DNSUtil(object):
                      '209.145.54.50',
                      '209.220.30.174',
                      '209.36.73.33',
+                     '209.85.229.138',
                      '211.94.66.147',
                      '213.169.251.35',
                      '216.221.188.182',
                      '216.234.179.13',
+                     '243.185.187.3',
                      '243.185.187.39'])
     max_retry = 3
     max_wait = 3
@@ -491,242 +786,9 @@ class DNSUtil(object):
 
 def spawn_later(seconds, target, *args, **kwargs):
     def wrap(*args, **kwargs):
-        import time
-        time.sleep(seconds)
+        __import__('time').sleep(seconds)
         return target(*args, **kwargs)
-    return threading._start_new_thread(wrap, args, kwargs)
-
-
-if 'gevent.monkey' in sys.modules:
-    class SSLConnection(object):
-        """gevent wrapper for python2 OpenSSL.SSL.Connection"""
-
-        def __init__(self, context, sock):
-            self._context = context
-            self._sock = sock
-            self._timeout = sock.gettimeout()
-            self._connection = OpenSSL.SSL.Connection(context, sock)
-            self._makefile_refs = 0
-            self.wait_read = gevent.socket.wait_read
-            self.wait_write = gevent.socket.wait_write
-            self.wait_readwrite = gevent.socket.wait_readwrite
-
-        def accept(self):
-            sock, addr = self._sock.accept()
-            client = SSLConnection(sock._context, sock)
-            return client, addr
-
-        def do_handshake(self):
-            while True:
-                try:
-                    self._connection.do_handshake()
-                    break
-                except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError, OpenSSL.SSL.WantWriteError):
-                    sys.exc_clear()
-                    self.wait_readwrite(self._sock.fileno(), timeout=self._timeout)
-
-        def connect(self, address, **kwargs):
-            while True:
-                try:
-                    self._connection.connect(address, **kwargs)
-                    break
-                except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
-                    sys.exc_clear()
-                    self.wait_read(self._sock.fileno(), timeout=self._timeout)
-                except OpenSSL.SSL.WantWriteError:
-                    sys.exc_clear()
-                    self.wait_write(self._sock.fileno(), timeout=self._timeout)
-
-        def connect_ex(self, address, **kwargs):
-            while True:
-                try:
-                    self._connection.connect(address, **kwargs)
-                    break
-                except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
-                    sys.exc_clear()
-                    self.wait_read(self._sock.fileno(), timeout=self._timeout)
-                except OpenSSL.SSL.WantWriteError:
-                    sys.exc_clear()
-                    self.wait_write(self._sock.fileno(), timeout=self._timeout)
-
-        def send(self, data, flags=0):
-            while True:
-                try:
-                    self._connection.send(data, flags)
-                    break
-                except OpenSSL.SSL.WantWriteError:
-                    sys.exc_clear()
-                    self.wait_write(self._sock.fileno(), timeout=self._timeout)
-                except OpenSSL.SSL.WantReadError:
-                    sys.exc_clear()
-                    self.wait_read(self._sock.fileno(), timeout=self._timeout)
-                except OpenSSL.SSL.SysCallError as e:
-                    if e[0] == -1 and not data:
-                        # errors when writing empty strings are expected and can be ignored
-                        return 0
-                    raise
-
-        def recv(self, bufsiz, flags=0):
-            pending = self._connection.pending()
-            if pending:
-                return self._connection.recv(min(pending, bufsiz))
-            while True:
-                try:
-                    return self._connection.recv(bufsiz, flags)
-                except OpenSSL.SSL.WantReadError:
-                    sys.exc_clear()
-                    self.wait_read(self._sock.fileno(), timeout=self._timeout)
-                except OpenSSL.SSL.WantWriteError:
-                    sys.exc_clear()
-                    self.wait_write(self._sock.fileno(), timeout=self._timeout)
-                except OpenSSL.SSL.ZeroReturnError:
-                    return ''
-
-        def read(self, bufsiz, flags=0):
-            return self.recv(bufsiz, flags)
-
-        def write(self, buf, flags=0):
-            return self.sendall(buf, flags)
-
-        def makefile(self, mode='rb', bufsize=-1):
-            self._makefile_refs += 1
-            return socket._fileobject(self, mode, bufsize, close=True)
-
-        def close(self):
-            if self._makefile_refs < 1:
-                self._connection.shutdown()
-                del self._connection
-            else:
-                self._makefile_refs -= 1
-
-        for f in ('get_context', 'pending', 'renegotiate',  'listen', 'sendall',
-                  'setblocking', 'fileno', 'shutdown', 'close', 'get_cipher_list',
-                  'getpeername', 'getsockname', 'getsockopt', 'setsockopt', 'bind',
-                  'get_app_data', 'set_app_data', 'state_string', 'sock_shutdown',
-                  'get_peer_certificate', 'get_peer_cert_chain', 'want_read', 'want_write',
-                  'set_connect_state', 'set_accept_state', 'settimeout',
-                  'set_tlsext_host_name'):
-            exec("""def %s(self, *args):
-                    return self._connection.%s(*args)\n""" % (f, f))
-else:
-    class SSLConnection(object):
-        """wrapper for python2 OpenSSL.SSL.Connection"""
-
-        def __init__(self, context, sock):
-            self._context = context
-            self._sock = sock
-            self._timeout = sock.gettimeout()
-            self._connection = OpenSSL.SSL.Connection(context, sock)
-            self._makefile_refs = 0
-
-        def __getattr__(self, attr):
-            if attr not in ('_context', '_sock', '_timeout', '_connection'):
-                return getattr(self._connection, attr)
-
-        def accept(self):
-            sock, addr = self._sock.accept()
-            client = SSLConnection(sock._context, sock)
-            return client, addr
-
-        def do_handshake(self):
-            waited = 0
-            ticker = 1.0
-            while True:
-                try:
-                    self._connection.do_handshake()
-                    break
-                except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError, OpenSSL.SSL.WantWriteError):
-                    sys.exc_clear()
-                    select.select([self._connection], [], [], ticker)
-                    waited += ticker
-                    if self._timeout and waited > self._timeout:
-                        raise socket.timeout('timed out')
-
-        def connect(self, address, **kwargs):
-            waited = 0
-            ticker = 1.0
-            while True:
-                try:
-                    self._connection.connect(address, **kwargs)
-                    break
-                except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
-                    sys.exc_clear()
-                    select.select([self._connection], [], [], ticker)
-                    waited += ticker
-                    if self._timeout and waited > self._timeout:
-                        raise socket.timeout('timed out')
-                except OpenSSL.SSL.WantWriteError:
-                    sys.exc_clear()
-                    select.select([], [self._connection], [], ticker)
-                    waited += ticker
-                    if self._timeout and waited > self._timeout:
-                        raise socket.timeout('timed out')
-
-        def send(self, data, flags=0):
-            waited = 0
-            ticker = 1.0
-            while True:
-                try:
-                    self._connection.send(data, flags)
-                    break
-                except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
-                    sys.exc_clear()
-                    select.select([self._connection], [], [], ticker)
-                    waited += ticker
-                    if self._timeout and waited > self._timeout:
-                        raise socket.timeout('timed out')
-                except OpenSSL.SSL.WantWriteError:
-                    sys.exc_clear()
-                    select.select([], [self._connection], [], ticker)
-                    waited += ticker
-                    if self._timeout and waited > self._timeout:
-                        raise socket.timeout('timed out')
-                except OpenSSL.SSL.SysCallError as e:
-                    if e[0] == -1 and not data:
-                        # errors when writing empty strings are expected and can be ignored
-                        return 0
-                    raise
-
-        def recv(self, bufsiz, flags=0):
-            waited = 0
-            ticker = 1.0
-            pending = self._connection.pending()
-            if pending:
-                return self._connection.recv(min(pending, bufsiz))
-            while True:
-                try:
-                    return self._connection.recv(bufsiz, flags)
-                except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
-                    sys.exc_clear()
-                    select.select([self._connection], [], [], ticker)
-                    waited += ticker
-                    if self._timeout and waited > self._timeout:
-                        raise socket.timeout('timed out')
-                except OpenSSL.SSL.WantWriteError:
-                    sys.exc_clear()
-                    select.select([], [self._connection], [], ticker)
-                    waited += ticker
-                    if self._timeout and waited > self._timeout:
-                        raise socket.timeout('timed out')
-                except OpenSSL.SSL.ZeroReturnError:
-                    return ''
-
-        def read(self, bufsiz, flags=0):
-            return self.recv(bufsiz, flags)
-
-        def write(self, buf, flags=0):
-            return self.sendall(buf, flags)
-
-        def makefile(self, mode='rb', bufsize=-1):
-            self._makefile_refs += 1
-            return socket._fileobject(self, mode, bufsize, close=True)
-
-        def close(self):
-            if self._makefile_refs < 1:
-                self._connection.shutdown()
-                del self._connection
-            else:
-                self._makefile_refs -= 1
+    return __import__('thread').start_new_thread(wrap, args, kwargs)
 
 
 class HTTPUtil(object):
