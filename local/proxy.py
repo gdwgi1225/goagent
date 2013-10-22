@@ -1678,32 +1678,40 @@ class RangeFetch(object):
                 raise
 
 
-class LocalProxyServer(socketserver.ThreadingTCPServer):
+class LocalProxyServer(SocketServer.ThreadingTCPServer):
     """Local Proxy Server"""
     allow_reuse_address = True
 
     def close_request(self, request):
-        """make ThreadingTCPServer happy"""
         try:
             request.close()
-        except:
+        except Exception:
             pass
 
-    def handle_error(self, request, client_address):
+    def finish_request(self, request, client_address):
+        try:
+            self.RequestHandlerClass(request, client_address, self)
+        except NetWorkIOError as e:
+            if e[0] not in (errno.ECONNABORTED, errno.ECONNRESET, errno.EPIPE):
+                raise
+
+    def handle_error(self, *args):
         """make ThreadingTCPServer happy"""
         etype, value, tb = sys.exc_info()
-        if isinstance(value, ssl.SSLError) and 'bad write retry' in value.args[1]:
+        if isinstance(value, NetWorkIOError) and 'bad write retry' in value.args[1]:
             etype = value = tb = None
         else:
-            socketserver.ThreadingTCPServer.handle_error(self, request, client_address)
+            del etype, value, tb
+            SocketServer.ThreadingTCPServer.handle_error(self, *args)
 
 
-class GAEProxyHandler(http.server.BaseHTTPRequestHandler):
+class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
     bufsize = 256*1024
     first_run_lock = threading.Lock()
     urlfetch = staticmethod(gae_urlfetch)
     normcookie = functools.partial(re.compile(', ([^ =]+(?:=|$))').sub, '\\r\\nSet-Cookie: \\1')
+    normattachment = functools.partial(re.compile(r'filename=(.+?)').sub, 'filename="\\1"')
 
     def _update_google_iplist(self):
         if any(not re.match(r'\d+\.\d+\.\d+\.\d+', x) for x in common.GOOGLE_HOSTS):
@@ -1713,16 +1721,18 @@ class GAEProxyHandler(http.server.BaseHTTPRequestHandler):
                 if not re.match(r'\d+\.\d+\.\d+\.\d+', domain):
                     try:
                         iplist = socket.gethostbyname_ex(domain)[-1]
-                        if len(iplist) >= 3:
+                        if len(iplist) >= 2:
                             google_ipmap[domain] = iplist
-                        if len(iplist) < 4:
-                            need_resolve_remote.append(domain)
-                    except (socket.error, ssl.SSLError, OSError):
+                    except (socket.error, OSError):
                         need_resolve_remote.append(domain)
                         continue
                 else:
                     google_ipmap[domain] = [domain]
-            for dnsserver in ('8.8.8.8', '8.8.4.4', '114.114.114.114', '114.114.115.115'):
+            google_iplist = list(set(sum(list(google_ipmap.values()), [])))
+            if len(google_iplist) < 10 or len(set(x.split('.', 1)[0] for x in google_iplist)) == 1:
+                logging.warning('local google_iplist=%s is too short, try remote_resolve', google_iplist)
+                need_resolve_remote += list(common.GOOGLE_HOSTS)
+            for dnsserver in common.DNS_DNSSERVER:
                 for domain in need_resolve_remote:
                     logging.info('resolve remote domain=%r from dnsserver=%r', domain, dnsserver)
                     try:
@@ -1730,7 +1740,7 @@ class GAEProxyHandler(http.server.BaseHTTPRequestHandler):
                         if iplist:
                             google_ipmap.setdefault(domain, []).extend(iplist)
                             logging.info('resolve remote domain=%r to iplist=%s', domain, google_ipmap[domain])
-                    except (socket.error, ssl.SSLError, OSError) as e:
+                    except (socket.error, OSError) as e:
                         logging.exception('resolve remote domain=%r dnsserver=%r failed: %s', domain, dnsserver, e)
             common.GOOGLE_HOSTS = list(set(sum(list(google_ipmap.values()), [])))
             if len(common.GOOGLE_HOSTS) == 0:
@@ -1753,10 +1763,13 @@ class GAEProxyHandler(http.server.BaseHTTPRequestHandler):
                 iplist = []
                 for host in hosts:
                     try:
-                        ips = socket.gethostbyname_ex(host)[-1]
+                        if common.DNS_ENABLE:
+                            ips = DNSUtil.remote_resolve('114.114.114.114', host)
+                        else:
+                            ips = socket.gethostbyname_ex(host)[-1]
                         if len(ips) > 1:
                             iplist += ips
-                    except (socket.error, ssl.SSLError, OSError) as e:
+                    except (socket.error, OSError) as e:
                         logging.error('socket.gethostbyname_ex(host=%r) failed:%s', host, e)
                 prefix = re.sub(r'\d+\.\d+$', '', random.choice(common.GOOGLE_HOSTS))
                 iplist = [x for x in iplist if x.startswith(prefix) and re.match(r'\d+\.\d+\.\d+\.\d+', x)]
@@ -1772,7 +1785,7 @@ class GAEProxyHandler(http.server.BaseHTTPRequestHandler):
                         socket.create_connection((host, 443), timeout=2).close()
                         end = time.time()
                         connect_timing += end - start
-                    except (socket.error, ssl.SSLError, OSError):
+                    except (socket.error, OSError):
                         # connect failed, need switch
                         connect_timing += 2
                         need_switch = True
@@ -1798,11 +1811,9 @@ class GAEProxyHandler(http.server.BaseHTTPRequestHandler):
                     if isinstance(self.__class__.first_run, collections.Callable):
                         self.first_run()
                         self.__class__.first_run = None
-            except (socket.error, ssl.SSLError, OSError) as e:
-                logging.error('GAEProxyHandler.first_run() return %r', e)
             except Exception as e:
                 logging.exception('GAEProxyHandler.first_run() return %r', e)
-        self.__class__.setup = http.server.BaseHTTPRequestHandler.setup
+        self.__class__.setup = BaseHTTPServer.BaseHTTPRequestHandler.setup
         self.__class__.do_GET = self.__class__.do_METHOD
         self.__class__.do_PUT = self.__class__.do_METHOD
         self.__class__.do_POST = self.__class__.do_METHOD
@@ -1814,32 +1825,34 @@ class GAEProxyHandler(http.server.BaseHTTPRequestHandler):
     def finish(self):
         """make python2 BaseHTTPRequestHandler happy"""
         try:
-            if not self.wfile.closed:
-                self.wfile.flush()
-            self.wfile.close()
-        except (socket.error, ssl.SSLError, OSError):
-            pass
-        self.rfile.close()
+            BaseHTTPServer.BaseHTTPRequestHandler.finish(self)
+        except NetWorkIOError as e:
+            if e[0] not in (errno.ECONNABORTED, errno.ECONNRESET, errno.EPIPE):
+                raise
 
     def address_string(self):
         return '%s:%s' % self.client_address[:2]
 
     def do_METHOD(self):
+        if HAS_PYPY:
+            self.path = re.sub(r'(://[^/]+):\d+/', '\\1/', self.path)
         host = self.headers.get('Host', '')
         if self.path[0] == '/' and host:
             self.path = 'http://%s%s' % (host, self.path)
-        self.parsed_url = urllib.parse.urlparse(self.path)
+        elif not host and '://' in self.path:
+            host = urlparse.urlparse(self.path).netloc
+        self.parsed_url = urlparse.urlparse(self.path)
 
         if common.USERAGENT_ENABLE:
             self.headers['User-Agent'] = common.USERAGENT_STRING
 
-        """rules match algorithm, need_forward= True or False"""
+        ### rules match algorithm, need_forward= True or False
         need_forward = False
-        if common.HOSTS_MATCH and any(x(self.path) for x in common.HOSTS_MATCH):
+        if common.HOSTS_MATCH and any(x(self.path) for x in common.HOSTS_MATCH) or self.command not in ('GET', 'POST', 'HEAD', 'PUT', 'DELETE', 'PATCH'):
             need_forward = True
         elif host.endswith(common.GOOGLE_SITES) and not host.endswith(common.GOOGLE_WITHGAE):
             if self.path.startswith(('http://www.google.com/url', 'http://www.google.com.hk/url', 'https://www.google.com/url', 'https://www.google.com.hk/url')):
-                urls = urllib.parse.parse_qs(self.parsed_url.query).get('url')
+                urls = urlparse.parse_qs(self.parsed_url.query).get('url')
                 if urls:
                     logging.debug('google search redirect to %s', urls[0])
                     self.wfile.write(('HTTP/1.1 301\r\nLocation: %s\r\n\r\n' % urls[0]).encode())
@@ -1874,17 +1887,17 @@ class GAEProxyHandler(http.server.BaseHTTPRequestHandler):
             logging.info('%s "FWD %s %s HTTP/1.1" %s %s', self.address_string(), self.command, self.path, response.status, response.getheader('Content-Length', '-'))
             if response.status in (400, 405):
                 common.GAE_CRLF = 0
-            self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k != 'Transfer-Encoding'))).encode())
+            self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
             while 1:
                 data = response.read(8192)
                 if not data:
                     break
                 self.wfile.write(data)
             response.close()
-        except (socket.error, ssl.SSLError, OSError) as e:
+        except NetWorkIOError as e:
             if e.args[0] in (errno.ECONNRESET, 10063, errno.ENAMETOOLONG):
                 logging.warn('http_util.request "%s %s" failed:%s, try addto `withgae`', self.command, self.path, e)
-                common.GOOGLE_WITHGAE.add(re.sub(r':\d+$', '', self.parsed_url.netloc))
+                common.GOOGLE_WITHGAE = tuple(list(common.GOOGLE_WITHGAE)+[re.sub(r':\d+$', '', self.parsed_url.netloc)])
             elif e.args[0] not in (errno.ECONNABORTED, errno.EPIPE):
                 raise
         except Exception as e:
@@ -1894,35 +1907,35 @@ class GAEProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def do_METHOD_GAE(self):
         """GAE http urlfetch"""
-        host = self.headers.get('Host', '')
+        request_headers = dict((k.title(), v) for k, v in self.headers.items())
+        host = request_headers.get('Host', '')
         path = self.parsed_url.path
         range_in_query = 'range=' in self.parsed_url.query
         special_range = (any(x(host) for x in common.AUTORANGE_HOSTS_MATCH) or path.endswith(common.AUTORANGE_ENDSWITH)) and not path.endswith(common.AUTORANGE_NOENDSWITH)
-        if 'Range' in self.headers:
-            m = re.search('bytes=(\d+)-', self.headers['Range'])
+        if 'Range' in request_headers:
+            m = re.search('bytes=(\d+)-', request_headers['Range'])
             start = int(m.group(1) if m else 0)
-            self.headers['Range'] = 'bytes=%d-%d' % (start, start+common.AUTORANGE_MAXSIZE-1)
-            logging.info('autorange range=%r match url=%r', self.headers['Range'], self.path)
+            request_headers['Range'] = 'bytes=%d-%d' % (start, start+common.AUTORANGE_MAXSIZE-1)
+            logging.info('autorange range=%r match url=%r', request_headers['Range'], self.path)
         elif not range_in_query and special_range:
-            try:
-                logging.info('Found [autorange]endswith match url=%r', self.path)
-                m = re.search('bytes=(\d+)-', self.headers.get('Range', ''))
-                start = int(m.group(1) if m else 0)
-                self.headers['Range'] = 'bytes=%d-%d' % (start, start+common.AUTORANGE_MAXSIZE-1)
-            except StopIteration:
-                pass
+            logging.info('Found [autorange]endswith match url=%r', self.path)
+            m = re.search('bytes=(\d+)-', request_headers.get('Range', ''))
+            start = int(m.group(1) if m else 0)
+            request_headers['Range'] = 'bytes=%d-%d' % (start, start+common.AUTORANGE_MAXSIZE-1)
 
         payload = b''
-        if 'Content-Length' in self.headers:
+        if 'Content-Length' in request_headers:
             try:
-                payload = self.rfile.read(int(self.headers.get('Content-Length', 0)))
-            except (EOFError, socket.error, ssl.SSLError, OSError) as e:
+                payload = self.rfile.read(int(request_headers.get('Content-Length', 0)))
+            except NetWorkIOError as e:
                 logging.error('handle_method_urlfetch read payload failed:%s', e)
                 return
         response = None
         errors = []
         headers_sent = False
         fetchserver = common.GAE_FETCHSERVER
+        if range_in_query and special_range:
+            fetchserver = re.sub(r'//\w+\.appspot\.com', '//%s.appspot.com' % random.choice(common.GAE_APPIDS), fetchserver)
         for retry in range(common.FETCHMAX_LOCAL):
             try:
                 content_length = 0
@@ -1931,7 +1944,7 @@ class GAEProxyHandler(http.server.BaseHTTPRequestHandler):
                     kwargs['password'] = common.GAE_PASSWORD
                 if common.GAE_VALIDATE:
                     kwargs['validate'] = 1
-                response = self.urlfetch(self.command, self.path, self.headers, payload, fetchserver, **kwargs)
+                response = self.urlfetch(self.command, self.path, request_headers, payload, fetchserver, **kwargs)
                 if not response and retry == common.FETCHMAX_LOCAL-1:
                     html = message_html('502 URLFetch failed', 'Local URLFetch %r failed' % self.path, str(errors))
                     self.wfile.write(b'HTTP/1.0 502\r\nContent-Type: text/html\r\n\r\n' + html.encode('utf-8'))
@@ -1941,13 +1954,31 @@ class GAEProxyHandler(http.server.BaseHTTPRequestHandler):
                     common.GOOGLE_MODE = 'https'
                     common.GAE_FETCHSERVER = '%s://%s.appspot.com%s?' % (common.GOOGLE_MODE, common.GAE_APPIDS[0], common.GAE_PATH)
                     continue
+                # appid not exists, try remove it from appid
+                if response.app_status == 404:
+                    if len(common.GAE_APPIDS) > 1:
+                        appid = common.GAE_APPIDS.pop(0)
+                        common.GAE_FETCHSERVER = '%s://%s.appspot.com%s?' % (common.GOOGLE_MODE, common.GAE_APPIDS[0], common.GAE_PATH)
+                        http_util.dns[urlparse.urlparse(common.GAE_FETCHSERVER).netloc] = common.GOOGLE_HOSTS
+                        logging.warning('APPID %r not exists, remove it.', appid)
+                        continue
+                    else:
+                        appid = common.GAE_APPIDS[0]
+                        logging.error('APPID %r not exists, please ensure your appid in proxy.ini.', appid)
+                        html = message_html('404 Appid Not Exists', 'Appid %r Not Exists' % appid, 'appid %r not exist, please edit your proxy.ini' % appid)
+                        self.wfile.write(b'HTTP/1.0 502\r\nContent-Type: text/html\r\n\r\n' + html.encode('utf-8'))
+                        return
                 # appid over qouta, switch to next appid
                 if response.app_status == 503:
-                    common.GAE_APPIDS.append(common.GAE_APPIDS.pop(0))
-                    common.GAE_FETCHSERVER = '%s://%s.appspot.com%s?' % (common.GOOGLE_MODE, common.GAE_APPIDS[0], common.GAE_PATH)
-                    http_util.dns[urllib.parse.urlparse(common.GAE_FETCHSERVER).netloc] = common.GOOGLE_HOSTS
-                    logging.info('APPID Over Quota,Auto Switch to [%s]' % (common.GAE_APPIDS[0]))
-                    continue
+                    if len(common.GAE_APPIDS) > 1:
+                        common.GAE_APPIDS.pop(0)
+                        common.GAE_FETCHSERVER = '%s://%s.appspot.com%s?' % (common.GOOGLE_MODE, common.GAE_APPIDS[0], common.GAE_PATH)
+                        http_util.dns[urlparse.urlparse(common.GAE_FETCHSERVER).netloc] = common.GOOGLE_HOSTS
+                        logging.info('Current APPID Over Quota,Auto Switch to [%s], Retrying…' % (common.GAE_APPIDS[0]))
+                        self.do_METHOD_GAE()
+                        return
+                    else:
+                        logging.error('All APPID Over Quota')
                 # bad request, disable CRLF injection
                 if response.app_status in (400, 405):
                     http_util.crlf = 0
@@ -1961,7 +1992,7 @@ class GAEProxyHandler(http.server.BaseHTTPRequestHandler):
                     continue
                 if response.app_status != 200 and retry == common.FETCHMAX_LOCAL-1:
                     logging.info('%s "GAE %s %s HTTP/1.1" %s -', self.address_string(), self.command, self.path, response.status)
-                    self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k != 'Transfer-Encoding'))).encode())
+                    self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
                     self.wfile.write(response.read())
                     response.close()
                     return
@@ -1973,15 +2004,19 @@ class GAEProxyHandler(http.server.BaseHTTPRequestHandler):
                         rangefetch = RangeFetch(self.wfile, response, self.command, self.path, self.headers, payload, fetchservers, common.GAE_PASSWORD, maxsize=common.AUTORANGE_MAXSIZE, bufsize=common.AUTORANGE_BUFSIZE, waitsize=common.AUTORANGE_WAITSIZE, threads=common.AUTORANGE_THREADS)
                         return rangefetch.fetch()
                     if response.getheader('Set-Cookie'):
-                        response.headers['Set-Cookie'] = self.normcookie(response.getheader('Set-Cookie'))
-                    headers_data = ('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))).encode()
+                        response_replace_header(response, 'Set-Cookie', self.normcookie(response.getheader('Set-Cookie')))
+                    if response.getheader('Content-Disposition') and '"' not in response.getheader('Content-Disposition'):
+                        response_replace_header(response, 'Content-Disposition', self.normattachment(response.getheader('Content-Disposition')))
+                    headers_data = 'HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))
+                    logging.debug('headers_data=%s', headers_data)
+                    #self.wfile.write(headers_data.encode() if bytes is not str else headers_data)
                     self.wfile.write(headers_data)
                     headers_sent = True
                 content_length = int(response.getheader('Content-Length', 0))
                 content_range = response.getheader('Content-Range', '')
                 accept_ranges = response.getheader('Accept-Ranges', 'none')
                 if content_range:
-                    start, end, length = list(map(int, re.search(r'bytes (\d+)-(\d+)/(\d+)', content_range).group(1, 2, 3)))
+                    start, end, length = tuple(int(x) for x in re.search(r'bytes (\d+)-(\d+)/(\d+)', content_range).group(1, 2, 3))
                 else:
                     start, end, length = 0, content_length-1, content_length
                 while 1:
@@ -2009,16 +2044,21 @@ class GAEProxyHandler(http.server.BaseHTTPRequestHandler):
                         # we can retry range fetch here
                         logging.warn('GAEProxyHandler.do_METHOD_GAE timed out, url=%r, content_length=%r, try again', self.path, content_length)
                         self.headers['Range'] = 'bytes=%d-%d' % (start, end)
-                elif isinstance(e, ssl.SSLError) and 'bad write retry' in e.args[1]:
-                    logging.debug('GAEProxyHandler.do_METHOD_GAE url=%r return %r, abort.', self.path, e)
+                elif isinstance(e, NetWorkIOError) and 'bad write retry' in e.args[-1]:
+                    logging.info('GAEProxyHandler.do_METHOD_GAE url=%r return %r, abort.', self.path, e)
                     return
                 else:
                     logging.exception('GAEProxyHandler.do_METHOD_GAE %r return %r, try again', self.path, e)
 
     def do_CONNECT(self):
         """handle CONNECT cmmand, socket forward or deploy a fake cert"""
-        host = self.path.rpartition(':')[0]
+        host, _, port = self.path.rpartition(':')
         if common.HOSTS_CONNECT_MATCH and any(x(self.path) for x in common.HOSTS_CONNECT_MATCH):
+            if host.endswith(common.GOOGLE_SITES) and not host.endswith(common.GOOGLE_WITHGAE):
+                http_util.dns.pop(host, None)
+            realhost = next(common.HOSTS_CONNECT_MATCH[x] for x in common.HOSTS_CONNECT_MATCH if x(self.path))
+            if realhost:
+                http_util.dns[host] = list(set(sum([socket.gethostbyname_ex(x)[-1] for x in realhost.split('|')], [])))
             self.do_CONNECT_FWD()
         elif host.endswith(common.GOOGLE_SITES) and not host.endswith(common.GOOGLE_WITHGAE):
             http_util.dns[host] = common.GOOGLE_HOSTS
@@ -2045,7 +2085,7 @@ class GAEProxyHandler(http.server.BaseHTTPRequestHandler):
                     elif i == 0:
                         # only print first create_connection error
                         logging.error('http_util.create_connection((host=%r, port=%r), %r) timeout', host, port, timeout)
-                except (socket.error, ssl.SSLError, OSError) as e:
+                except NetWorkIOError as e:
                     if e.args[0] == 9:
                         logging.error('GAEProxyHandler direct forward remote (%r, %r) failed', host, port)
                         continue
@@ -2073,10 +2113,18 @@ class GAEProxyHandler(http.server.BaseHTTPRequestHandler):
         self.__realconnection = None
         self.wfile.write(b'HTTP/1.1 200 OK\r\n\r\n')
         try:
-            ssl_sock = ssl.wrap_socket(self.connection, certfile=certfile, keyfile=certfile, server_side=True, ssl_version=ssl.PROTOCOL_SSLv23)
+            if not http_util.ssl_validate and not http_util.ssl_obfuscate:
+                ssl_sock = ssl.wrap_socket(self.connection, keyfile=certfile, certfile=certfile, server_side=True)
+            else:
+                ssl_context = OpenSSL.SSL.Context(OpenSSL.SSL.TLSv1_METHOD)
+                ssl_context.use_privatekey_file(certfile)
+                ssl_context.use_certificate_file(certfile)
+                ssl_sock = SSLConnection(ssl_context, self.connection)
+                ssl_sock.set_accept_state()
+                ssl_sock.do_handshake()
         except Exception as e:
             if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET):
-                logging.error('ssl.wrap_socket(self.connection=%r) failed: %s', self.connection, e)
+                logging.exception('ssl.wrap_socket(self.connection=%r) failed: %s', self.connection, e)
             return
         self.__realconnection = self.connection
         self.__realwfile = self.wfile
@@ -2097,14 +2145,14 @@ class GAEProxyHandler(http.server.BaseHTTPRequestHandler):
                 return
             if not self.parse_request():
                 return
-        except (socket.error, ssl.SSLError, OSError) as e:
+        except NetWorkIOError as e:
             if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET, errno.EPIPE):
                 raise
         if self.path[0] == '/' and host:
             self.path = 'https://%s%s' % (self.headers['Host'], self.path)
         try:
             self.do_METHOD()
-        except (socket.error, ssl.SSLError, OSError) as e:
+        except NetWorkIOError as e:
             if e.args[0] not in (errno.ECONNABORTED, errno.ETIMEDOUT, errno.EPIPE):
                 raise
         finally:
@@ -2112,14 +2160,13 @@ class GAEProxyHandler(http.server.BaseHTTPRequestHandler):
                 try:
                     self.__realconnection.shutdown(socket.SHUT_WR)
                     self.__realconnection.close()
-                except (socket.error, ssl.SSLError, OSError):
+                except NetWorkIOError:
                     pass
                 finally:
                     self.__realconnection = None
 
 
 def paas_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
-    # deflate = lambda x:zlib.compress(x)[2:-4]
     if payload:
         if len(payload) < 10 * 1024 * 1024 and 'Content-Encoding' not in headers:
             zpayload = zlib.compress(payload)[2:-4]
@@ -2128,25 +2175,34 @@ def paas_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
                 headers['Content-Encoding'] = 'deflate'
         headers['Content-Length'] = str(len(payload))
     skip_headers = http_util.skip_headers
-    if 'xorchar' not in kwargs and fetchserver.startswith('http://'):
-        kwargs['xorchar'] = random.choice(kwargs.get('password') or 'goagent')
     if common.PAAS_VALIDATE:
         kwargs['validate'] = 1
     metadata = 'G-Method:%s\nG-Url:%s\n%s%s' % (method, url, ''.join('G-%s:%s\n' % (k, v) for k, v in kwargs.items() if v), ''.join('%s:%s\n' % (k, v) for k, v in headers.items() if k not in skip_headers))
-    metadata = zlib.compress(metadata.encode())[2:-4]
+    metadata = zlib.compress(metadata)[2:-4]
     app_payload = b''.join((struct.pack('!h', len(metadata)), metadata, payload))
     fetchserver += '?%s' % random.random()
-    response = http_util.request('POST', fetchserver, app_payload, {'Content-Length': len(app_payload)}, crlf=0)
+    crlf = 0 if fetchserver.startswith('https') else common.PAAS_CRLF
+    response = http_util.request('POST', fetchserver, app_payload, {'Content-Length': len(app_payload)}, crlf=crlf)
     if not response:
         raise socket.error(errno.ECONNRESET, 'urlfetch %r return None' % url)
     response.app_status = response.status
-    if response.getheader('x-status'):
-        response.status = int(response.getheader('x-status'))
-        del response.headers['x-status']
-    response_read = response.read
-    if 'xorchar' in kwargs and 200 <= response.app_status < 400:
-        ordchar = ord(kwargs['xorchar'])
-        response.read = lambda n: bytes(c ^ ordchar for c in response_read(n))
+    if response.status != 200:
+        if response.status in (400, 405):
+            # filter by some firewall
+            common.PAAS_CRLF = 0
+        return response
+    data = response.read(4)
+    if len(data) < 4:
+        response.status = 502
+        response.fp = io.BytesIO(b'connection aborted. too short leadtype data=' + data)
+        return response
+    response.status, headers_length = struct.unpack('!hh', data)
+    data = response.read(headers_length)
+    if len(data) < headers_length:
+        response.status = 502
+        response.fp = io.BytesIO(b'connection aborted. too short headers data=' + data)
+        return response
+    response.msg = httplib.HTTPMessage(io.BytesIO(zlib.decompress(data, -zlib.MAX_WBITS)))
     return response
 
 
@@ -2157,7 +2213,7 @@ class PAASProxyHandler(GAEProxyHandler):
 
     def first_run(self):
         if not common.PROXY_ENABLE:
-            fetchhost = re.sub(r':\d+$', '', urllib.parse.urlparse(common.PAAS_FETCHSERVER).netloc)
+            fetchhost = re.sub(r':\d+$', '', urlparse.urlparse(common.PAAS_FETCHSERVER).netloc)
             logging.info('resolve common.PAAS_FETCHSERVER domain=%r to iplist', fetchhost)
             fethhost_iplist = http_util.dns_resolve(fetchhost)
             if len(fethhost_iplist) == 0:
@@ -2174,11 +2230,11 @@ class PAASProxyHandler(GAEProxyHandler):
                     if isinstance(self.__class__.first_run, collections.Callable):
                         self.first_run()
                         self.__class__.first_run = None
-            except (socket.error, ssl.SSLError, OSError) as e:
+            except NetWorkIOError as e:
                 logging.error('PAASProxyHandler.first_run() return %r', e)
             except Exception as e:
                 logging.exception('PAASProxyHandler.first_run() return %r', e)
-        self.__class__.setup = http.server.BaseHTTPRequestHandler.setup
+        self.__class__.setup = BaseHTTPServer.BaseHTTPRequestHandler.setup
         self.__class__.do_GET = self.__class__.do_METHOD
         self.__class__.do_PUT = self.__class__.do_METHOD
         self.__class__.do_POST = self.__class__.do_METHOD
@@ -2190,17 +2246,18 @@ class PAASProxyHandler(GAEProxyHandler):
 
     def do_METHOD(self):
         try:
-            host = self.headers.get('Host', '')
+            headers = dict((k.title(), v) for k, v in self.headers.items())
+            host = headers.get('Host', '')
             payload = b''
-            if 'Content-Length' in self.headers:
+            if 'Content-Length' in headers:
                 try:
-                    payload = self.rfile.read(int(self.headers.get('Content-Length', 0)))
-                except (EOFError, socket.error, ssl.SSLError, OSError) as e:
+                    payload = self.rfile.read(int(headers.get('Content-Length', 0)))
+                except NetWorkIOError as e:
                     logging.error('handle_method read payload failed:%s', e)
                     return
             response = None
             errors = []
-            for i in range(common.FETCHMAX_LOCAL):
+            for _ in range(common.FETCHMAX_LOCAL):
                 try:
                     kwargs = {}
                     if common.PAAS_PASSWORD:
@@ -2209,7 +2266,7 @@ class PAASProxyHandler(GAEProxyHandler):
                         kwargs['validate'] = 1
                     if common.CONFIG.has_option('hosts', host):
                         kwargs['hostip'] = random.choice(http_util.dns_resolve(host))
-                    response = self.urlfetch(self.command, self.path, self.headers, payload, common.PAAS_FETCHSERVER, **kwargs)
+                    response = self.urlfetch(self.command, self.path, headers, payload, common.PAAS_FETCHSERVER, **kwargs)
                     if response:
                         break
                 except Exception as e:
@@ -2225,149 +2282,55 @@ class PAASProxyHandler(GAEProxyHandler):
                 http_util.crlf = 0
 
             if response.getheader('Set-Cookie'):
-                response.headers['Set-Cookie'] = re.sub(', ([^ =]+(?:=|$))', '\\r\\nSet-Cookie: \\1', response.getheader('Set-Cookie'))
-            self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))).encode())
+                response_replace_header(response, 'Set-Cookie', self.normcookie(response.getheader('Set-Cookie')))
+            self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
 
             while 1:
-                data = response.read(32768)
+                data = response.read(8192)
                 if not data:
                     break
                 self.wfile.write(data)
             response.close()
 
-        except (socket.error, ssl.SSLError, OSError) as e:
+        except NetWorkIOError as e:
             # Connection closed before proxy return
             if e.args[0] not in (errno.ECONNABORTED, errno.EPIPE):
                 raise
 
 
-class Autoproxy2Pac(object):
-    """Autoproxy to Pac Class, based on https://github.com/iamamac/autoproxy2pac"""
-    def __init__(self, url, proxy, default='DIRECT', encoding='utf-8'):
-        self.url = url
-        self.proxy = proxy
-        self.default = default
-        self.encoding = encoding
+class PACServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
-    def _fetch_rulelist(self):
-        proxies = {'http': self.proxy, 'https': self.proxy}
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
-        response = opener.open(self.url)
-        content = response.read()
-        response.close()
-        # if self.encoding:
-        #     if self.encoding == 'base64':
-        #         content = base64.b64decode(content)
-        content = base64.b64decode(content)
-        return content.decode(self.encoding)
+    pacfile = os.path.join(os.path.dirname(os.path.abspath(__file__)), common.PAC_FILE)
+    onepixel = b'GIF89a\x01\x00\x01\x00\x80\xff\x00\xc0\xc0\xc0\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;'
 
-    def _rule2js(self, ruleList, indent=4):
-        jsCode = []
-        # Filter options (those parts start with "$") is not supported
-        for line in ruleList.splitlines()[1:]:
-            # Ignore the first line ([AutoProxy x.x]), empty lines and comments
-            if line and not line.startswith("!"):
-                useProxy = True
-                # Exceptions
-                if line.startswith("@@"):
-                    line = line[2:]
-                    useProxy = False
-                # Regular expressions
-                if line.startswith("/") and line.endswith("/"):
-                    jsRegexp = line[1:-1]
-                # Other cases
-                else:
-                    # Remove multiple wildcards
-                    jsRegexp = re.sub(r"\*+", r"*", line)
-                    # Remove anchors following separator placeholder
-                    jsRegexp = re.sub(r"\^\|$", r"^", jsRegexp, 1)
-                    # Escape special symbols
-                    jsRegexp = re.sub(r"(\W)", r"\\\1", jsRegexp)
-                    # Replace wildcards by .*
-                    jsRegexp = re.sub(r"\\\*", r".*", jsRegexp)
-                    # Process separator placeholders
-                    jsRegexp = re.sub(r"\\\^", r"(?:[^\w\-.%\u0080-\uFFFF]|$)", jsRegexp)
-                    # Process extended anchor at expression start
-                    #jsRegexp = re.sub(r"^\\\|\\\|", r"^[\w\-]+:\/+(?!\/)(?:[^\/]+\.)?", jsRegexp, 1)
-                    jsRegexp = re.sub(r"^\\\|\\\|", r"^https?:\/\/(?:\w+\.)?", jsRegexp, 1)
-                    # Process anchor at expression start
-                    jsRegexp = re.sub(r"^\\\|", "^", jsRegexp, 1)
-                    # Process anchor at expression end
-                    jsRegexp = re.sub(r"\\\|$", "$", jsRegexp, 1)
-                    # Remove leading wildcards
-                    jsRegexp = re.sub(r"^(\.\*)", "", jsRegexp, 1)
-                    # Remove trailing wildcards
-                    jsRegexp = re.sub(r"(\.\*)$", "", jsRegexp, 1)
-                    if jsRegexp == "":
-                        jsRegexp = ".*"
-                        logging.warning("There is one rule that matches all URL, which is highly *NOT* recommended: %s", line)
-                jsLine = 'if(/%s/i.test(url)) return "%s";' % (jsRegexp, 'PROXY %s' % self.proxy if useProxy else self.default)
-                jsLine = ' '*indent + jsLine
-                if useProxy:
-                    jsCode.append(jsLine)
-                else:
-                    jsCode.insert(0, jsLine)
-        return '\n'.join(jsCode)
+    def address_string(self):
+        return '%s:%s' % self.client_address[:2]
 
-    def generate_pac(self, filename):
-        rulelist = self._fetch_rulelist()
-        jsrule = self._rule2js(rulelist, indent=4)
-        if os.path.isfile(filename):
-            with open(filename, 'rb') as fp:
-                content = fp.read()
-        lines = content.decode('utf-8').splitlines()
-        if lines[0].strip().startswith('//'):
-            lines[0] = '// Proxy Auto-Config file generated by autoproxy2pac, %s' % time.strftime('%Y-%m-%d %H:%M:%S')
-        content = '\r\n'.join(lines)
-        function = 'function FindProxyForURLByAutoProxy(url, host) {\r\n%s\r\nreturn "%s";\r\n}' % (jsrule, self.default)
-        content = re.sub('(?is)function\\s*FindProxyForURLByAutoProxy\\s*\\(url, host\\)\\s*{.+\r\n}', function, content)
-        content = re.sub(r'''goagent\s*=\s*['"]PROXY [\.\w:]+['"]''', 'goagent = \'PROXY %s\'' % self.proxy, content)
-        return content
-
-    @staticmethod
-    def get_listen_ip():
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.connect(('8.8.8.8', 53))
-        listen_ip = sock.getsockname()[0]
-        sock.close()
-        return listen_ip
-
-    @classmethod
-    def update_filename(cls, filename, url, proxy, default='DIRECT'):
-        logging.info('autoproxy pac filename=%r out of date, try update it', filename)
-        autoproxy = cls(url, proxy, default)
-        content = autoproxy.generate_pac(filename)
-        logging.info('autoproxy gfwlist=%r fetched and parsed.', common.PAC_GFWLIST)
-        with open(filename, 'wb') as fp:
-            fp.write(content.encode('utf8'))
-        logging.info('autoproxy pac filename=%r updated', filename)
-
-
-class PACServerHandler(http.server.BaseHTTPRequestHandler):
-
-    pacfile = os.path.join(os.path.dirname(__file__), common.PAC_FILE)
-
-    def first_run(self):
-        if time.time() - os.path.getmtime(self.pacfile) > 24 * 60 * 60:
-            default = '%s:%s' % (common.PROXY_HOST, common.PROXY_PORT) if common.PROXY_ENABLE else 'DIRECT'
-            listen_ip = common.LISTEN_IP
-            if listen_ip in ('', '0.0.0.0', '::'):
-                listen_ip = Autoproxy2Pac.get_listen_ip()
-            spawn_later(1, Autoproxy2Pac.update_filename, self.pacfile, common.PAC_GFWLIST, '%s:%s' % (listen_ip, common.LISTEN_PORT), default)
-        return True
+    def do_CONNECT(self):
+        self.wfile.write(b'HTTP/1.1 403\r\nConnection: close\r\n\r\n')
 
     def do_GET(self):
-        filename = os.path.normpath('./' + self.path)
-        self.first_run()
-        if os.path.isfile(filename):
+        filename = os.path.normpath('./' + urlparse.urlparse(self.path).path)
+        if self.path.startswith(('http://', 'https://')):
+            data = b'HTTP/1.1 200\r\nCache-Control: max-age=86400\r\nExpires:Oct, 01 Aug 2100 00:00:00 GMT\r\nConnection: close\r\n'
+            if filename.endswith(('.jpg', '.gif', '.jpeg', '.bmp')):
+                data += b'Content-Type: image/gif\r\n\r\n' + self.onepixel
+            else:
+                data += b'\r\n'
+            self.wfile.write(data)
+            logging.info('%s "%s %s HTTP/1.1" 200 -', self.address_string(), self.command, self.path)
+        elif os.path.isfile(filename):
             if filename.endswith('.pac'):
-                mimetype = 'application/x-ns-proxy-autoconfig'
+                mimetype = 'text/plain'
             else:
                 mimetype = 'application/octet-stream'
+            if self.path.endswith('.pac?flush'):
+                thread.start_new_thread(PacUtil.update_pacfile, (self.pacfile,))
+            elif time.time() - os.path.getmtime(self.pacfile) > common.PAC_EXPIRED:
+                thread.start_new_thread(lambda: os.utime(self.pacfile, (time.time(), time.time())) or PacUtil.update_pacfile(self.pacfile), tuple())
             self.send_file(filename, mimetype)
         else:
             self.wfile.write(b'HTTP/1.1 404\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n404 Not Found')
-            self.wfile.close()
             logging.info('%s "%s %s HTTP/1.1" 404 -', self.address_string(), self.command, self.path)
 
     def send_file(self, filename, mimetype):
@@ -2384,7 +2347,7 @@ class DNSServer(socketserver.ThreadingUDPServer):
     """DNS Proxy over TCP to avoid DNS poisoning"""
     allow_reuse_address = True
 
-    dnsservers = ['8.8.8.8', '8.8.4.4']
+    dnsservers = common.DNS_DNSSERVER
     max_wait = 1
     max_retry = 2
     max_cache_size = 2000
