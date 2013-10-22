@@ -1293,8 +1293,8 @@ class Common(object):
 
     def __init__(self):
         """load config from proxy.ini"""
-        configparser.RawConfigParser.OPTCRE = re.compile(r'(?P<option>[^=\s][^=]*)\s*(?P<vi>[=])\s*(?P<value>.*)$')
-        self.CONFIG = configparser.ConfigParser()
+        ConfigParser.RawConfigParser.OPTCRE = re.compile(r'(?P<option>[^=\s][^=]*)\s*(?P<vi>[=])\s*(?P<value>.*)$')
+        self.CONFIG = ConfigParser.ConfigParser()
         self.CONFIG_FILENAME = os.path.splitext(os.path.abspath(__file__))[0]+'.ini'
         self.CONFIG.read(self.CONFIG_FILENAME)
 
@@ -1303,7 +1303,7 @@ class Common(object):
         self.LISTEN_VISIBLE = self.CONFIG.getint('listen', 'visible')
         self.LISTEN_DEBUGINFO = self.CONFIG.getint('listen', 'debuginfo') if self.CONFIG.has_option('listen', 'debuginfo') else 0
 
-        self.GAE_APPIDS = re.findall('[\w\-\.]+', self.CONFIG.get('gae', 'appid').replace('.appspot.com', ''))
+        self.GAE_APPIDS = re.findall(r'[\w\-\.]+', self.CONFIG.get('gae', 'appid').replace('.appspot.com', ''))
         self.GAE_PASSWORD = self.CONFIG.get('gae', 'password').strip()
         self.GAE_PATH = self.CONFIG.get('gae', 'path')
         self.GAE_PROFILE = self.CONFIG.get('gae', 'profile')
@@ -1316,10 +1316,13 @@ class Common(object):
         self.PAC_PORT = self.CONFIG.getint('pac', 'port')
         self.PAC_FILE = self.CONFIG.get('pac', 'file').lstrip('/')
         self.PAC_GFWLIST = self.CONFIG.get('pac', 'gfwlist')
+        self.PAC_ADBLOCK = self.CONFIG.get('pac', 'adblock')
+        self.PAC_EXPIRED = self.CONFIG.getint('pac', 'expired')
 
         self.PAAS_ENABLE = self.CONFIG.getint('paas', 'enable')
         self.PAAS_LISTEN = self.CONFIG.get('paas', 'listen')
         self.PAAS_PASSWORD = self.CONFIG.get('paas', 'password') if self.CONFIG.has_option('paas', 'password') else ''
+        self.PAAS_CRLF = self.CONFIG.getint('paas', 'crlf') if self.CONFIG.has_option('paas', 'crlf') else 1
         self.PAAS_VALIDATE = self.CONFIG.getint('paas', 'validate') if self.CONFIG.has_option('paas', 'validate') else 0
         self.PAAS_FETCHSERVER = self.CONFIG.get('paas', 'fetchserver')
 
@@ -1333,7 +1336,7 @@ class Common(object):
         if not self.PROXY_ENABLE and self.PROXY_AUTODETECT:
             system_proxy = ProxyUtil.get_system_proxy()
             if system_proxy and self.LISTEN_IP not in system_proxy:
-                scheme, username, password, address = ProxyUtil.parse_proxy(system_proxy)
+                _, username, password, address = ProxyUtil.parse_proxy(system_proxy)
                 proxyhost, _, proxyport = address.rpartition(':')
                 self.PROXY_ENABLE = 1
                 self.PROXY_USERNAME = username
@@ -1368,6 +1371,7 @@ class Common(object):
         if self.CONFIG.has_section('dns'):
             self.DNS_ENABLE = self.CONFIG.getint('dns', 'enable')
             self.DNS_LISTEN = self.CONFIG.get('dns', 'listen')
+            self.DNS_DNSSERVER = self.CONFIG.get('dns', 'dns').split('|')
             self.DNS_REMOTE = self.CONFIG.get('dns', 'remote')
             self.DNS_TIMEOUT = self.CONFIG.getint('dns', 'timeout')
             self.DNS_CACHESIZE = self.CONFIG.getint('dns', 'cachesize')
@@ -1388,9 +1392,10 @@ class Common(object):
         self.LOVE_ENABLE = self.CONFIG.getint('love', 'enable')
         self.LOVE_TIP = self.CONFIG.get('love', 'tip').encode('utf8').decode('unicode-escape').split('|')
 
-        self.HOSTS = collections.OrderedDict(self.CONFIG.items('hosts'))
-        self.HOSTS_MATCH = collections.OrderedDict((re.compile(k).search, v) for k, v in self.HOSTS.items() if not re.search(r'\d+$', k))
-        self.HOSTS_CONNECT_MATCH = collections.OrderedDict((re.compile(k).search, v) for k, v in self.HOSTS.items() if re.search(r'\d+$', k))
+        DictType = getattr(collections, 'OrderedDict', dict)
+        self.HOSTS = DictType(self.CONFIG.items('hosts'))
+        self.HOSTS_MATCH = DictType((re.compile(k).search, v) for k, v in self.HOSTS.items() if not re.search(r'\d+$', k))
+        self.HOSTS_CONNECT_MATCH = DictType((re.compile(k).search, v) for k, v in self.HOSTS.items() if re.search(r'\d+$', k))
 
         random.shuffle(self.GAE_APPIDS)
         self.GAE_FETCHSERVER = '%s://%s.appspot.com%s?' % (self.GOOGLE_MODE, self.GAE_APPIDS[0], self.GAE_PATH)
@@ -1427,11 +1432,11 @@ common = Common()
 http_util = HTTPUtil(max_window=common.GOOGLE_WINDOW, ssl_validate=common.GAE_VALIDATE or common.PAAS_VALIDATE, ssl_obfuscate=common.GAE_OBFUSCATE, proxy=common.proxy)
 
 
-def message_html(self, title, banner, detail=''):
+def message_html(title, banner, detail=''):
     MESSAGE_TEMPLATE = '''
     <html><head>
     <meta http-equiv="content-type" content="text/html;charset=utf-8">
-    <title>{{ title }}</title>
+    <title>$title</title>
     <style><!--
     body {font-family: arial,sans-serif}
     div.nav {margin-top: 1ex}
@@ -1448,23 +1453,25 @@ def message_html(self, title, banner, detail=''):
     <tr><td bgcolor=#3366cc><font face=arial,sans-serif color=#ffffff><b>Message</b></td></tr>
     <tr><td> </td></tr></table>
     <blockquote>
-    <H1>{{ banner }}</H1>
-    {{ detail }}
+    <H1>$banner</H1>
+    $detail
     <p>
     </blockquote>
     <table width=100% cellpadding=0 cellspacing=0><tr><td bgcolor=#3366cc><img alt="" width=1 height=4></td></tr></table>
     </body></html>
     '''
-    kwargs = dict(title=title, banner=banner, detail=detail)
-    template = MESSAGE_TEMPLATE
-    for keyword, value in kwargs.items():
-        template = template.replace('{{ %s }}' % keyword, value)
-    return template
+    return string.Template(MESSAGE_TEMPLATE).substitute(title=title, banner=banner, detail=detail)
+
+
+def response_replace_header(response, name, value):
+    if sys.hexversion < 0x3000000:
+        response.msg[name] = value
+    else:
+        response.header.replace_header(name, value)
 
 
 def gae_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
     # deflate = lambda x:zlib.compress(x)[2:-4]
-    assert isinstance(payload, bytes)
     if payload:
         if len(payload) < 10 * 1024 * 1024 and 'Content-Encoding' not in headers:
             zpayload = zlib.compress(payload)[2:-4]
@@ -1478,7 +1485,7 @@ def gae_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
     metadata = 'G-Method:%s\nG-Url:%s\n%s' % (method, url, ''.join('G-%s:%s\n' % (k, v) for k, v in kwargs.items() if v))
     skip_headers = http_util.skip_headers
     metadata += ''.join('%s:%s\n' % (k.title(), v) for k, v in headers.items() if k not in skip_headers)
-    metadata = zlib.compress(metadata.encode())[2:-4]
+    metadata = zlib.compress(metadata)[2:-4]
     need_crlf = 0 if fetchserver.startswith('https') else common.GAE_CRLF
     if common.GAE_OBFUSCATE:
         cookie = base64.b64encode(metadata).strip().decode()
@@ -1506,7 +1513,7 @@ def gae_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
         response.status = 502
         response.fp = io.BytesIO(b'connection aborted. too short headers data=' + data)
         return response
-    response.headers = response.msg = http.client.parse_headers(io.BytesIO(zlib.decompress(data, -zlib.MAX_WBITS)))
+    response.msg = httplib.HTTPMessage(io.BytesIO(zlib.decompress(data, -zlib.MAX_WBITS)))
     return response
 
 
@@ -1540,24 +1547,24 @@ class RangeFetch(object):
         response_headers = dict((k.title(), v) for k, v in self.response.getheaders())
         content_range = response_headers['Content-Range']
         #content_length = response_headers['Content-Length']
-        start, end, length = list(map(int, re.search(r'bytes (\d+)-(\d+)/(\d+)', content_range).group(1, 2, 3)))
+        start, end, length = tuple(int(x) for x in re.search(r'bytes (\d+)-(\d+)/(\d+)', content_range).group(1, 2, 3))
         if start == 0:
             response_status = 200
             response_headers['Content-Length'] = str(length)
+            del response_headers['Content-Range']
         else:
             response_headers['Content-Range'] = 'bytes %s-%s/%s' % (start, end, length)
             response_headers['Content-Length'] = str(length-start)
 
         logging.info('>>>>>>>>>>>>>>> RangeFetch started(%r) %d-%d', self.url, start, end)
-        self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response_status, ''.join('%s: %s\r\n' % (k, v) for k, v in response_headers.items()))).encode())
+        self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response_status, ''.join('%s: %s\r\n' % (k, v) for k, v in response_headers.items()))))
 
-        data_queue = queue.PriorityQueue()
-        range_queue = queue.PriorityQueue()
+        data_queue = Queue.PriorityQueue()
+        range_queue = Queue.PriorityQueue()
         range_queue.put((start, end, self.response))
         for begin in range(end+1, length, self.maxsize):
             range_queue.put((begin, min(begin+self.maxsize-1, length-1), None))
-        for i in range(self.threads):
-            threading._start_new_thread(self.__fetchlet, (range_queue, data_queue))
+        any(thread.start_new_thread(self.__fetchlet, (range_queue, data_queue)) for _ in range(self.threads))
         has_peek = hasattr(data_queue, 'peek')
         peek_timeout = 90
         expect_begin = start
@@ -1584,19 +1591,19 @@ class RangeFetch(object):
                     else:
                         logging.error('RangeFetch Error: begin(%r) < expect_begin(%r), quit.', begin, expect_begin)
                         break
-            except queue.Empty:
+            except Queue.Empty:
                 logging.error('data_queue peek timeout, break')
                 break
             try:
                 self.wfile.write(data)
                 expect_begin += len(data)
-            except (socket.error, ssl.SSLError, OSError) as e:
+            except Exception as e:
                 logging.info('RangeFetch client connection aborted(%s).', e)
                 break
         self._stopped = True
 
     def __fetchlet(self, range_queue, data_queue):
-        headers = copy.copy(self.headers)
+        headers = dict((k.title(), v) for k, v in self.headers.items())
         headers['Connection'] = 'close'
         while 1:
             try:
@@ -1614,10 +1621,12 @@ class RangeFetch(object):
                         if self._last_app_status.get(fetchserver, 200) >= 500:
                             time.sleep(5)
                         response = self.urlfetch(self.command, self.url, headers, self.payload, fetchserver, password=self.password)
-                except queue.Empty:
+                except Queue.Empty:
                     continue
-                except (socket.error, ssl.SSLError, OSError) as e:
+                except Exception as e:
                     logging.warning("Response %r in __fetchlet", e)
+                    range_queue.put((start, end, None))
+                    continue
                 if not response:
                     logging.warning('RangeFetch %s return %r', headers['Range'], response)
                     range_queue.put((start, end, None))
@@ -1630,7 +1639,7 @@ class RangeFetch(object):
                     range_queue.put((start, end, None))
                     continue
                 if response.getheader('Location'):
-                    self.url = response.getheader('Location')
+                    self.url = urlparse.urljoin(self.url, response.getheader('Location'))
                     logging.info('RangeFetch Redirect(%r)', self.url)
                     response.close()
                     range_queue.put((start, end, None))
@@ -1651,10 +1660,10 @@ class RangeFetch(object):
                                 break
                             data_queue.put((start, data))
                             start += len(data)
-                        except (socket.error, ssl.SSLError, OSError) as e:
+                        except Exception as e:
                             logging.warning('RangeFetch "%s %s" %s failed: %s', self.command, self.url, headers['Range'], e)
                             break
-                    if start < end:
+                    if start < end + 1:
                         logging.warning('RangeFetch "%s %s" retry %s-%s', self.command, self.url, start, end)
                         response.close()
                         range_queue.put((start, end, None))
