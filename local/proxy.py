@@ -512,7 +512,7 @@ class PacUtil(object):
             logging.info('%r successfully updated', filename)
 
     @staticmethod
-    def autoproxy2pac(content, func_name='FindProxyForURLByAutoProxy', proxy='127.0.0.1:8087', default='DIRECT', indent=4):
+    def autoproxy2pac(content, func_name='FindProxyForURLByAutoProxy', proxy='1127.0.0.1:1998', default='DIRECT', indent=4):
         """Autoproxy to Pac, based on https://github.com/iamamac/autoproxy2pac"""
         jsLines = []
         for line in content.splitlines()[1:]:
@@ -546,7 +546,7 @@ class PacUtil(object):
         return function
 
     @staticmethod
-    def urlfilter2pac(content, func_name='FindProxyForURLByUrlfilter', proxy='127.0.0.1:8086', default='DIRECT', indent=4):
+    def urlfilter2pac(content, func_name='FindProxyForURLByUrlfilter', proxy='1127.0.0.1:1999', default='DIRECT', indent=4):
         """urlfilter.ini to Pac, based on https://github.com/iamamac/autoproxy2pac"""
         jsLines = []
         for line in content[content.index('[exclude]'):].splitlines()[1:]:
@@ -569,7 +569,7 @@ class PacUtil(object):
         return function
 
     @staticmethod
-    def adblock2pac(content, func_name='FindProxyForURLByAdblock', proxy='127.0.0.1:8086', default='DIRECT', indent=4):
+    def adblock2pac(content, func_name='FindProxyForURLByAdblock', proxy='1127.0.0.1:1999', default='DIRECT', indent=4):
         """adblock list to Pac, based on https://github.com/iamamac/autoproxy2pac"""
         jsLines = []
         for line in content.splitlines()[1:]:
@@ -2343,61 +2343,111 @@ class PACServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self.wfile.write(data)
 
 
-class DNSServer(socketserver.ThreadingUDPServer):
-    """DNS Proxy over TCP to avoid DNS poisoning"""
-    allow_reuse_address = True
+class DNSServer(gevent.server.DatagramServer if gevent and hasattr(gevent.server, 'DatagramServer') else object):
+    """DNS TCP Proxy based on gevent/dnslib"""
 
+    blacklist = set(['1.1.1.1',
+                     '255.255.255.255',
+                     # for google+
+                     '74.125.127.102',
+                     '74.125.155.102',
+                     '74.125.39.102',
+                     '74.125.39.113',
+                     '209.85.229.138',
+                     # other ip list
+                     '4.36.66.178',
+                     '8.7.198.45',
+                     '37.61.54.158',
+                     '46.82.174.68',
+                     '59.24.3.173',
+                     '64.33.88.161',
+                     '64.33.99.47',
+                     '64.66.163.251',
+                     '65.104.202.252',
+                     '65.160.219.113',
+                     '66.45.252.237',
+                     '72.14.205.104',
+                     '72.14.205.99',
+                     '78.16.49.15',
+                     '93.46.8.89',
+                     '128.121.126.139',
+                     '159.106.121.75',
+                     '169.132.13.103',
+                     '192.67.198.6',
+                     '202.106.1.2',
+                     '202.181.7.85',
+                     '203.161.230.171',
+                     '203.98.7.65',
+                     '207.12.88.98',
+                     '208.56.31.43',
+                     '209.145.54.50',
+                     '209.220.30.174',
+                     '209.36.73.33',
+                     '209.85.229.138',
+                     '211.94.66.147',
+                     '213.169.251.35',
+                     '216.221.188.182',
+                     '216.234.179.13',
+                     '243.185.187.3',
+                     '243.185.187.39'])
     dnsservers = common.DNS_DNSSERVER
-    max_wait = 1
-    max_retry = 2
+    timeout = 2
     max_cache_size = 2000
-    timeout = 6
 
-    def __init__(self, server_address, *args, **kwargs):
-        socketserver.ThreadingUDPServer.__init__(self, server_address, self.handle, *args, **kwargs)
-        self._writelock = threading.Semaphore()
-        self.cache = {}
+    def __init__(self, *args, **kwargs):
+        super(DNSServer, self).__init__(*args, **kwargs)
+        self.dns_cache = {}
 
-    def handle(self, request, address, server):
-        data, server_socket = request
-        reqid = data[:2]
-        domain = data[12:data.find(b'\x00', 12)].decode()
-        if len(self.cache) > self.max_cache_size:
-            self.cache.clear()
-        if domain not in self.cache:
-            qname = re.sub(r'[\x01-\x29]', '.', domain[1:])
-            try:
-                dnsserver = random.choice(self.dnsservers)
-                logging.info('DNSServer resolve domain=%r by dnsserver=%r to iplist', qname, dnsserver)
-                data = DNSUtil._remote_resolve(dnsserver, qname, self.timeout)
-                if not data:
-                    logging.warning('DNSServer resolve domain=%r return data=%s', qname, data)
+    def _dns_resolver(self, qname, qtype, qdata, dnsserver, result_queue):
+        sock = gevent.socket.socket(socket.AF_INET6 if qtype == dnslib.QTYPE.AAAA else socket.AF_INET, socket.SOCK_DGRAM)
+        sock.sendto(qdata, (dnsserver, 53))
+        sock.sendto(qdata, (dnsserver, 53))
+        for _ in xrange(2):
+            data, _ = sock.recvfrom(512)
+            reply = dnslib.DNSRecord.parse(data)
+            if any(str(x.rdata) in self.blacklist for x in reply.rr):
+                logging.warning('query %r return bad rdata=%r', qname, [str(x.rdata) for x in reply.rr])
+            else:
+                result_queue.put(data)
+                sock.close()
+                break
+
+    def handle(self, data, address):
+        logging.debug('receive from %r data=%r', address, data)
+        request = dnslib.DNSRecord.parse(data)
+        qname = str(request.q.qname)
+        qtype = request.q.qtype
+        if len(self.dns_cache) > self.max_cache_size:
+            self.dns_cache.clear()
+        reply_data = self.dns_cache.get((qname, qtype))
+        if not reply_data:
+            result_queue = gevent.queue.Queue()
+            for dnsserver in self.dnsservers:
+                gevent.spawn(self._dns_resolver, qname, qtype, data, dnsserver, result_queue)
+            while True:
+                try:
+                    data = result_queue.get(timeout=self.timeout)
+                    reply_data = self.dns_cache[(qname, qtype)] = data
+                    break
+                except gevent.queue.Empty:
+                    logging.warning('query %r timed out', qname)
                     return
-                iplist = DNSUtil._reply_to_iplist(data)
-                self.cache[domain] = data
-                logging.info('DNSServer resolve domain=%r return iplist=%s', qname, iplist)
-            except (socket.error, ssl.SSLError, OSError) as e:
-                logging.error('DNSServer resolve domain=%r to iplist failed:%s', qname, e)
-        self._writelock.acquire()
-        try:
-            server_socket.sendto(reqid + self.cache[domain], address)
-        finally:
-            self._writelock.release()
+        return self.sendto(data[:2] + reply_data[2:], address)
 
 
 def pre_start():
     if sys.platform == 'cygwin':
         logging.info('cygwin is not officially supported, please continue at your own risk :)')
         #sys.exit(-1)
-    if os.name == 'posix':
+    elif os.name == 'posix':
         try:
             import resource
             resource.setrlimit(resource.RLIMIT_NOFILE, (8192, -1))
         except ValueError:
             pass
-    if ctypes and os.name == 'nt':
-        UnicodeType = type(b''.decode())
-        ctypes.windll.kernel32.SetConsoleTitleW(UnicodeType('GoAgent v%s' % __version__))
+    elif os.name == 'nt':
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleTitleW(u'GoAgent v%s' % __version__)
         if not common.LISTEN_VISIBLE:
             ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
         else:
@@ -2413,25 +2463,26 @@ def pre_start():
             tasklist = os.popen('tasklist').read().lower()
             softwares = [x for x in softwares if x.lower()in tasklist]
             if softwares:
-                title = UnicodeType('GoAgent 建议')
-                error = UnicodeType('某些安全软件(如 %s)可能和本软件存在冲突，造成 CPU 占用过高。\n如有此现象建议暂时退出此安全软件来继续运行GoAgent' % ','.join(softwares))
+                title = u'GoAgent 建议'
+                error = u'某些安全软件(如 %s)可能和本软件存在冲突，造成 CPU 占用过高。\n如有此现象建议暂时退出此安全软件来继续运行GoAgent' % ','.join(softwares)
                 ctypes.windll.user32.MessageBoxW(None, error, title, 0)
                 #sys.exit(0)
     if common.GAE_APPIDS[0] == 'goagent':
         logging.critical('please edit %s to add your appid to [gae] !', common.CONFIG_FILENAME)
         sys.exit(-1)
     if common.PAC_ENABLE:
-        url = 'http://%s:%d/%s' % (common.PAC_IP, common.PAC_PORT, common.PAC_FILE)
-        spawn_later(600, lambda x: urllib.request.build_opener(urllib.request.ProxyHandler({})).open(x), url)
-    if common.PAAS_ENABLE:
-        if common.PAAS_FETCHSERVER.startswith('http://') and not common.PAAS_PASSWORD:
-            logging.warning('Dont forget set your PAAS fetchserver password or use https')
+        pac_ip = ProxyUtil.get_listen_ip() if common.PAC_IP in ('', '::', '0.0.0.0') else common.PAC_IP
+        url = 'http://%s:%d/%s' % (pac_ip, common.PAC_PORT, common.PAC_FILE)
+        spawn_later(600, lambda x: urllib2.build_opener(urllib2.ProxyHandler({})).open(x), url)
+    if common.DNS_ENABLE:
+        if dnslib is None or gevent.version_info[0] < 1:
+            logging.critical('GoAgent DNSServer requires dnslib and gevent 1.0')
+            sys.exit(-1)
     if not OpenSSL:
         logging.warning('python-openssl not found, please install it!')
-    if 'uvent.loop' in sys.modules and gevent.__version__ != '1.0fake':
-        if isinstance(gevent.get_hub().loop, __import__('uvent').loop.UVLoop):
-            logging.info('Uvent enabled, patch forward_socket')
-            http_util.forward_socket = http_util.green_forward_socket
+    if 'uvent.loop' in sys.modules and isinstance(gevent.get_hub().loop, __import__('uvent').loop.UVLoop):
+        logging.info('Uvent enabled, patch forward_socket')
+        http_util.forward_socket = http_util.green_forward_socket
 
 
 def main():
@@ -2448,24 +2499,24 @@ def main():
     if common.PAAS_ENABLE:
         host, port = common.PAAS_LISTEN.split(':')
         server = LocalProxyServer((host, int(port)), PAASProxyHandler)
-        threading._start_new_thread(server.serve_forever, tuple())
+        thread.start_new_thread(server.serve_forever, tuple())
 
     if common.LIGHT_ENABLE:
         host, port = common.LIGHT_LISTEN.split(':')
         server = LocalProxyServer((host, int(port)), LightProxyHandler())
-        threading._start_new_thread(server.serve_forever, tuple())
+        thread.start_new_thread(server.serve_forever, tuple())
 
     if common.PAC_ENABLE:
         server = LocalProxyServer((common.PAC_IP, common.PAC_PORT), PACServerHandler)
-        threading._start_new_thread(server.serve_forever, tuple())
+        thread.start_new_thread(server.serve_forever, tuple())
 
     if common.DNS_ENABLE:
         host, port = common.DNS_LISTEN.split(':')
         server = DNSServer((host, int(port)))
-        server.remote_addresses = common.DNS_REMOTE.split('|')
+        server.dnsservers = common.DNS_REMOTE.split('|')
         server.timeout = common.DNS_TIMEOUT
         server.max_cache_size = common.DNS_CACHESIZE
-        threading._start_new_thread(server.serve_forever, tuple())
+        thread.start_new_thread(server.serve_forever, tuple())
 
     server = LocalProxyServer((common.LISTEN_IP, common.LISTEN_PORT), GAEProxyHandler)
     server.serve_forever()
