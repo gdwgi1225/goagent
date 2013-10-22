@@ -3,8 +3,8 @@
 # Contributor:
 #      Phus Lu        <phus.lu@gmail.com>
 
-__version__ = '2.1.17'
-__password__ = 'gdwgi1225'
+__version__ = '3.0.5'
+__password__ = ''
 __hostsdeny__ = ()  # __hostsdeny__ = ('.youtube.com', '.youku.com')
 
 import sys
@@ -18,6 +18,7 @@ import logging
 import httplib
 import urlparse
 import errno
+import string
 try:
     from io import BytesIO
 except ImportError:
@@ -31,6 +32,10 @@ try:
     import sae
 except ImportError:
     sae = None
+try:
+    import bae.core.wsgi
+except ImportError:
+    bae = None
 try:
     import socket
     import select
@@ -46,121 +51,35 @@ URLFETCH_MAXSIZE = 4*1024*1024
 URLFETCH_DEFLATE_MAXSIZE = 4*1024*1024
 URLFETCH_TIMEOUT = 60
 
-
-class base92:
-    """https://github.com/thenoviceoof/base92"""
-    @staticmethod
-    def encode(bytstr):
-        def base92_chr(val):
-            if val < 0 or val >= 91:
-                raise ValueError('val must be in [0, 91)')
-            if val == 0:
-                return '!'
-            elif val <= 61:
-                return chr(ord('#') + val - 1)
-            else:
-                return chr(ord('a') + val - 62)
-        # always encode *something*, in case we need to avoid empty strings
-        if not bytstr:
-            return '~'
-        # make sure we have a bytstr
-        if not isinstance(bytstr, basestring):
-            # we'll assume it's a sequence of ints
-            bytstr = ''.join([chr(b) for b in bytstr])
-        # prime the pump
-        bitstr = ''
-        while len(bitstr) < 13 and bytstr:
-            bitstr += '{:08b}'.format(ord(bytstr[0]))
-            bytstr = bytstr[1:]
-        resstr = ''
-        while len(bitstr) > 13 or bytstr:
-            i = int(bitstr[:13], 2)
-            resstr += base92_chr(i / 91)
-            resstr += base92_chr(i % 91)
-            bitstr = bitstr[13:]
-            while len(bitstr) < 13 and bytstr:
-                bitstr += '{:08b}'.format(ord(bytstr[0]))
-                bytstr = bytstr[1:]
-        if bitstr:
-            if len(bitstr) < 7:
-                bitstr += '0' * (6 - len(bitstr))
-                resstr += base92_chr(int(bitstr, 2))
-            else:
-                bitstr += '0' * (13 - len(bitstr))
-                i = int(bitstr, 2)
-                resstr += base92_chr(i / 91)
-                resstr += base92_chr(i % 91)
-        return resstr
-
-    @staticmethod
-    def decode(bstr):
-        def base92_ord(val):
-            num = ord(val)
-            if val == '!':
-                return 0
-            elif ord('#') <= num and num <= ord('_'):
-                return num - ord('#') + 1
-            elif ord('a') <= num and num <= ord('}'):
-                return num - ord('a') + 62
-            else:
-                raise ValueError('val is not a base92 character')
-        bitstr = ''
-        resstr = ''
-        if bstr == '~':
-            return ''
-        # we always have pairs of characters
-        for i in range(len(bstr)/2):
-            x = base92_ord(bstr[2*i])*91 + base92_ord(bstr[2*i+1])
-            bitstr += '{:013b}'.format(x)
-            while 8 <= len(bitstr):
-                resstr += chr(int(bitstr[0:8], 2))
-                bitstr = bitstr[8:]
-        # if we have an extra char, check for extras
-        if len(bstr) % 2 == 1:
-            x = base92_ord(bstr[-1])
-            bitstr += '{:06b}'.format(x)
-            while 8 <= len(bitstr):
-                resstr += chr(int(bitstr[0:8], 2))
-                bitstr = bitstr[8:]
-        return resstr
-
-
 def message_html(title, banner, detail=''):
-    ERROR_TEMPLATE = '''
-<html><head>
-<meta http-equiv="content-type" content="text/html;charset=utf-8">
-<title>{{ title }}</title>
-<style><!--
-body {font-family: arial,sans-serif}
-div.nav {margin-top: 1ex}
-div.nav A {font-size: 10pt; font-family: arial,sans-serif}
-span.nav {font-size: 10pt; font-family: arial,sans-serif; font-weight: bold}
-div.nav A,span.big {font-size: 12pt; color: #0000cc}
-div.nav A {font-size: 10pt; color: black}
-A.l:link {color: #6f6f6f}
-A.u:link {color: green}
-//--></style>
-</head>
-<body text=#000000 bgcolor=#ffffff>
-<table border=0 cellpadding=2 cellspacing=0 width=100%>
-<tr><td bgcolor=#3366cc><font face=arial,sans-serif color=#ffffff><b>Message</b></td></tr>
-<tr><td>&nbsp;</td></tr></table>
-<blockquote>
-<H1>{{ banner }}</H1>
-{{ detail }}
-<!--
-<script type="text/javascript" src="http://www.qq.com/404/search_children.js" charset="utf-8"></script>
-//-->
-<p>
-</blockquote>
-<table width=100% cellpadding=0 cellspacing=0><tr><td bgcolor=#3366cc><img alt="" width=1 height=4></td></tr></table>
-</body></html>
-'''
-    kwargs = dict(title=title, banner=banner, detail=detail)
-    template = ERROR_TEMPLATE
-    for keyword, value in kwargs.items():
-        template = template.replace('{{ %s }}' % keyword, value)
-    return template
+    MESSAGE_TEMPLATE = '''
+    <html><head>
+    <meta http-equiv="content-type" content="text/html;charset=utf-8">
+    <title>$title</title>
+    <style><!--
+    body {font-family: arial,sans-serif}
+    div.nav {margin-top: 1ex}
+    div.nav A {font-size: 10pt; font-family: arial,sans-serif}
+    span.nav {font-size: 10pt; font-family: arial,sans-serif; font-weight: bold}
+    div.nav A,span.big {font-size: 12pt; color: #0000cc}
+    div.nav A {font-size: 10pt; color: black}
+    A.l:link {color: #6f6f6f}
+    A.u:link {color: green}
+    //--></style>
+    </head>
+    <body text=#000000 bgcolor=#ffffff>
+    <table border=0 cellpadding=2 cellspacing=0 width=100%>
+    <tr><td bgcolor=#3366cc><font face=arial,sans-serif color=#ffffff><b>Message</b></td></tr>
+    <tr><td> </td></tr></table>
+    <blockquote>
+    <H1>$banner</H1>
+    $detail
+    <p>
+    </blockquote>
+    <table width=100% cellpadding=0 cellspacing=0><tr><td bgcolor=#3366cc><img alt="" width=1 height=4></td></tr></table>
+    </body></html>
+    '''
+    return string.Template(MESSAGE_TEMPLATE).substitute(title=title, banner=banner, detail=detail)
 
 
 def gae_application(environ, start_response):
@@ -258,6 +177,7 @@ def gae_application(environ, start_response):
             time.sleep(1)
             deadline = URLFETCH_TIMEOUT * 2
         except urlfetch.ResponseTooLargeError as e:
+            errors.append('%r, deadline=%s' % (e, deadline))
             response = e.response
             logging.error('ResponseTooLargeError(deadline=%s, url=%r) response(%r)', deadline, url, response)
             m = re.search(r'=\s*(\d+)-', headers.get('Range') or headers.get('range') or '')
@@ -280,7 +200,8 @@ def gae_application(environ, start_response):
         start_response('500 Internal Server Error', [('Content-Type', 'text/html')])
         error_string = '<br />\n'.join(errors)
         if not error_string:
-            error_string = 'Internal Server Error. <p/><a href="javascript:window.location.reload(true);">refresh</a> current page or visit <a href="https://appengine.google.com/" target="_blank">appengine.google.com</a> for error logs'
+            logurl = 'https://appengine.google.com/logs?&app_id=%s' % os.environ['APPLICATION_ID']
+            error_string = 'Internal Server Error. <p/>try <a href="javascript:window.location.reload(true);">refresh</a> or goto <a href="%s" target="_blank">appengine.google.com</a> for details' % logurl
         yield message_html('502 Urlfetch Error', 'Python Urlfetch Error: %r' % method,  error_string)
         raise StopIteration
 
@@ -288,14 +209,8 @@ def gae_application(environ, start_response):
 
     data = response.content
     response_headers = response.headers
-    if response_headers.get('content-encoding') == 'gzip' and 'deflate' in accept_encoding and len(response.content) < URLFETCH_DEFLATE_MAXSIZE:
-        data = data[10:-8]
-        response_headers['Content-Encoding'] = 'deflate'
-    elif 'content-encoding' not in response_headers and len(response.content) < URLFETCH_DEFLATE_MAXSIZE and response_headers.get('content-type', '').startswith(('text/', 'application/json', 'application/javascript')):
-        if 'deflate' in accept_encoding:
-            response_headers['Content-Encoding'] = 'deflate'
-            data = zlib.compress(data)[2:-4]
-        elif 'gzip' in accept_encoding:
+    if 'content-encoding' not in response_headers and len(response.content) < URLFETCH_DEFLATE_MAXSIZE and response_headers.get('content-type', '').startswith(('text/', 'application/json', 'application/javascript')):
+        if 'gzip' in accept_encoding:
             response_headers['Content-Encoding'] = 'gzip'
             compressobj = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL, 0)
             dataio = BytesIO()
@@ -304,7 +219,11 @@ def gae_application(environ, start_response):
             dataio.write(compressobj.flush())
             dataio.write(struct.pack('<LL', zlib.crc32(data) & 0xFFFFFFFFL, len(data) & 0xFFFFFFFFL))
             data = dataio.getvalue()
-    response_headers['Content-Length'] = str(len(data))
+        elif 'deflate' in accept_encoding:
+            response_headers['Content-Encoding'] = 'deflate'
+            data = zlib.compress(data)[2:-4]
+    if data:
+         response_headers['Content-Length'] = str(len(data))
     response_headers_data = zlib.compress('\n'.join('%s:%s' % (k.title(), v) for k, v in response_headers.items() if not k.startswith('x-google-')))[2:-4]
     start_response('200 OK', [('Content-Type', 'image/gif')])
     yield struct.pack('!hh', int(response.status_code), len(response_headers_data))+response_headers_data
@@ -456,32 +375,27 @@ def paas_application(environ, start_response):
         start_response('302 Found', [('Location', 'https://www.google.com')])
         raise StopIteration
 
-    # inflate = lambda x:zlib.decompress(x, -zlib.MAX_WBITS)
     wsgi_input = environ['wsgi.input']
     data = wsgi_input.read(2)
     metadata_length, = struct.unpack('!h', data)
     metadata = wsgi_input.read(metadata_length)
 
     metadata = zlib.decompress(metadata, -zlib.MAX_WBITS)
-    headers = dict(x.split(':', 1) for x in metadata.splitlines() if x)
+    headers = {}
+    for line in metadata.splitlines():
+        if line:
+            keyword, value = line.split(':', 1)
+            headers[keyword.title()] = value.strip()
     method = headers.pop('G-Method')
     url = headers.pop('G-Url')
+    timeout = URLFETCH_TIMEOUT
 
     kwargs = {}
     any(kwargs.__setitem__(x[2:].lower(), headers.pop(x)) for x in headers.keys() if x.startswith('G-'))
 
-    headers['Connection'] = 'close'
-
-    payload = environ['wsgi.input'].read() if 'Content-Length' in headers else None
-    if 'Content-Encoding' in headers:
-        if headers['Content-Encoding'] == 'deflate':
-            payload = zlib.decompress(payload, -zlib.MAX_WBITS)
-            headers['Content-Length'] = str(len(payload))
-            del headers['Content-Encoding']
-
     if __password__ and __password__ != kwargs.get('password'):
         random_host = 'g%d%s' % (int(time.time()*100), environ['HTTP_HOST'])
-        conn = httplib.HTTPConnection(random_host, timeout=3)
+        conn = httplib.HTTPConnection(random_host, timeout=timeout)
         conn.request('GET', '/')
         response = conn.getresponse(True)
         status_line = '%s %s' % (response.status, httplib.responses.get(response.status, 'OK'))
@@ -494,8 +408,13 @@ def paas_application(environ, start_response):
         yield message_html('403 Forbidden Host', 'Hosts Deny(%s)' % url, detail='url=%r' % url)
         raise StopIteration
 
-    timeout = URLFETCH_TIMEOUT
-    xorchar = ord(kwargs.get('xorchar') or '\x00')
+    headers['Connection'] = 'close'
+    payload = environ['wsgi.input'].read() if 'Content-Length' in headers else None
+    if 'Content-Encoding' in headers:
+        if headers['Content-Encoding'] == 'deflate':
+            payload = zlib.decompress(payload, -zlib.MAX_WBITS)
+            headers['Content-Length'] = str(len(payload))
+            del headers['Content-Encoding']
 
     logging.info('%s "%s %s %s" - -', environ['REMOTE_ADDR'], method, url, 'HTTP/1.1')
 
@@ -508,7 +427,7 @@ def paas_application(environ, start_response):
         sock = rfile._sock
         host, _, port = url.rpartition(':')
         port = int(port)
-        remote_sock = socket.create_connection((host, port), timeout=URLFETCH_TIMEOUT)
+        remote_sock = socket.create_connection((host, port), timeout=timeout)
         start_response('200 OK', [])
         forward_socket(sock, remote_sock)
         yield 'out'
@@ -524,26 +443,26 @@ def paas_application(environ, start_response):
             conn.request(method, path, body=payload, headers=headers)
             response = conn.getresponse()
 
-            headers = [('X-Status', str(response.status))]
-            headers += [(k, v) for k, v in response.msg.items() if k != 'transfer-encoding']
-            start_response('200 OK', headers)
-
-            bufsize = 8192
+            headers_data = zlib.compress('\n'.join('%s:%s' % (k.title(), v) for k, v in response.getheaders()))[2:-4]
+            start_response('200 OK', [('Content-Type', 'image/gif')])
+            yield struct.pack('!hh', int(response.status), len(headers_data))+headers_data
             while 1:
-                data = response.read(bufsize)
+                data = response.read(8192)
                 if not data:
                     response.close()
                     break
-                if xorchar:
-                    yield ''.join(chr(ord(x) ^ xorchar) for x in data)
-                else:
-                    yield data
+                yield data
         except httplib.HTTPException:
             raise
 
 
 app = gae_application if urlfetch else paas_application
-application = app if sae is None else sae.create_wsgi_app(app)
+if bae:
+    application = bae.core.wsgi.WSGIApplication(app)
+elif sae:
+    application = sae.create_wsgi_app(app)
+else:
+    application = app
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(levelname)s - - %(asctime)s %(message)s', datefmt='[%b %d %H:%M:%S]')
