@@ -39,6 +39,7 @@ except (ImportError, SystemError):
     gevent = None
 
 import errno
+import binascii
 import time
 import struct
 import collections
@@ -337,17 +338,24 @@ class CertUtil(object):
         if not os.path.exists(certdir):
             os.makedirs(certdir)
 
-gevent_wait_read = gevent.socket.wait_read if 'gevent.socket' in sys.modules else lambda fd,t: select.select([fd], [], [fd], t)
-gevent_wait_write = gevent.socket.wait_write if 'gevent.socket' in sys.modules else lambda fd,t: select.select([], [fd], [fd], t)
-gevent_wait_readwrite = gevent.socket.wait_readwrite if 'gevent.socket' in sys.modules else lambda fd,t: select.select([fd], [fd], [fd], t)
 
 class SSLConnection(object):
+
+    has_gevent = socket.socket is getattr(sys.modules.get('gevent.socket'), 'socket', None)
 
     def __init__(self, context, sock):
         self._context = context
         self._sock = sock
         self._connection = OpenSSL.SSL.Connection(context, sock)
         self._makefile_refs = 0
+        if self.has_gevent:
+            self._wait_read = gevent.socket.wait_read
+            self._wait_write = gevent.socket.wait_write
+            self._wait_readwrite = gevent.socket.wait_readwrite
+        else:
+            self._wait_read = lambda fd,t: select.select([fd], [], [fd], t)
+            self._wait_write = lambda fd,t: select.select([], [fd], [fd], t)
+            self._wait_readwrite = lambda fd,t: select.select([fd], [fd], [fd], t)
 
     def __getattr__(self, attr):
         if attr not in ('_context', '_sock', '_connection', '_makefile_refs'):
@@ -366,7 +374,7 @@ class SSLConnection(object):
                 break
             except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError, OpenSSL.SSL.WantWriteError):
                 sys.exc_clear()
-                gevent_wait_readwrite(self._sock.fileno(), timeout)
+                self.wait_readwrite(self._sock.fileno(), timeout)
 
     def connect(self, *args, **kwargs):
         timeout = self._sock.gettimeout()
@@ -376,10 +384,10 @@ class SSLConnection(object):
                 break
             except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
                 sys.exc_clear()
-                gevent_wait_read(self._sock.fileno(), timeout)
+                self.wait_read(self._sock.fileno(), timeout)
             except OpenSSL.SSL.WantWriteError:
                 sys.exc_clear()
-                gevent_wait_write(self._sock.fileno(), timeout)
+                self.wait_write(self._sock.fileno(), timeout)
 
     def send(self, data, flags=0):
         timeout = self._sock.gettimeout()
@@ -389,10 +397,10 @@ class SSLConnection(object):
                 break
             except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
                 sys.exc_clear()
-                gevent_wait_read(self._sock.fileno(), timeout)
+                self.wait_read(self._sock.fileno(), timeout)
             except OpenSSL.SSL.WantWriteError:
                 sys.exc_clear()
-                gevent_wait_write(self._sock.fileno(), timeout)
+                self.wait_write(self._sock.fileno(), timeout)
             except OpenSSL.SSL.SysCallError as e:
                 if e[0] == -1 and not data:
                     # errors when writing empty strings are expected and can be ignored
@@ -409,10 +417,10 @@ class SSLConnection(object):
                 return self._connection.recv(bufsiz, flags)
             except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
                 sys.exc_clear()
-                gevent_wait_read(self._sock.fileno(), timeout)
+                self.wait_read(self._sock.fileno(), timeout)
             except OpenSSL.SSL.WantWriteError:
                 sys.exc_clear()
-                gevent_wait_write(self._sock.fileno(), timeout)
+                self.wait_write(self._sock.fileno(), timeout)
             except OpenSSL.SSL.ZeroReturnError:
                 return ''
 
@@ -855,6 +863,18 @@ class HTTPUtil(object):
         self.ssl_obfuscate = ssl_obfuscate or self.ssl_obfuscate
         if self.ssl_validate or self.ssl_obfuscate:
             self.ssl_context = OpenSSL.SSL.Context(OpenSSL.SSL.TLSv1_METHOD)
+            self.ssl_context.set_session_id(binascii.b2a_hex(os.urandom(10)))
+            if hasattr(OpenSSL.SSL, 'SESS_CACHE_BOTH'):
+                self.ssl_context.set_session_cache_mode(OpenSSL.SSL.SESS_CACHE_BOTH)
+            else:
+                try:
+                    import ctypes
+                    SSL_CTRL_SET_SESS_CACHE_MODE = 44
+                    SESS_CACHE_BOTH = 0x3
+                    ctx = ctypes.c_void_p.from_address(id(self.ssl_context)+ctypes.sizeof(ctypes.c_int)+ctypes.sizeof(ctypes.c_voidp))
+                    ctypes.cdll.ssleay32.SSL_CTX_ctrl(ctx, SSL_CTRL_SET_SESS_CACHE_MODE, SESS_CACHE_BOTH, None)
+                except Exception as e:
+                    logging.warning('SSL_CTX_set_session_cache_mode failed: %r', e)
         else:
             self.ssl_context = None
         if self.ssl_validate:
@@ -2113,15 +2133,16 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self.__realconnection = None
         self.wfile.write(b'HTTP/1.1 200 OK\r\n\r\n')
         try:
-            if not http_util.ssl_validate and not http_util.ssl_obfuscate:
-                ssl_sock = ssl.wrap_socket(self.connection, keyfile=certfile, certfile=certfile, server_side=True)
-            else:
-                ssl_context = OpenSSL.SSL.Context(OpenSSL.SSL.TLSv1_METHOD)
-                ssl_context.use_privatekey_file(certfile)
-                ssl_context.use_certificate_file(certfile)
-                ssl_sock = SSLConnection(ssl_context, self.connection)
-                ssl_sock.set_accept_state()
-                ssl_sock.do_handshake()
+            ssl_sock = ssl.wrap_socket(self.connection, keyfile=certfile, certfile=certfile, server_side=True)
+            # if not http_util.ssl_validate and not http_util.ssl_obfuscate:
+            #     ssl_sock = ssl.wrap_socket(self.connection, keyfile=certfile, certfile=certfile, server_side=True)
+            # else:
+            #     ssl_context = OpenSSL.SSL.Context(OpenSSL.SSL.TLSv1_METHOD)
+            #     ssl_context.use_privatekey_file(certfile)
+            #     ssl_context.use_certificate_file(certfile)
+            #     ssl_sock = SSLConnection(ssl_context, self.connection)
+            #     ssl_sock.set_accept_state()
+            #     ssl_sock.do_handshake()
         except Exception as e:
             if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET):
                 logging.exception('ssl.wrap_socket(self.connection=%r) failed: %s', self.connection, e)
