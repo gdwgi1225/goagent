@@ -387,7 +387,7 @@ class SSLConnection(object):
                 break
             except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError, OpenSSL.SSL.WantWriteError):
                 sys.exc_clear()
-                self.wait_readwrite(self._sock.fileno(), timeout)
+                self._wait_readwrite(self._sock.fileno(), timeout)
 
     def connect(self, *args, **kwargs):
         timeout = self._sock.gettimeout()
@@ -397,10 +397,10 @@ class SSLConnection(object):
                 break
             except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
                 sys.exc_clear()
-                self.wait_read(self._sock.fileno(), timeout)
+                self._wait_read(self._sock.fileno(), timeout)
             except OpenSSL.SSL.WantWriteError:
                 sys.exc_clear()
-                self.wait_write(self._sock.fileno(), timeout)
+                self._wait_write(self._sock.fileno(), timeout)
 
     def send(self, data, flags=0):
         timeout = self._sock.gettimeout()
@@ -410,10 +410,10 @@ class SSLConnection(object):
                 break
             except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
                 sys.exc_clear()
-                self.wait_read(self._sock.fileno(), timeout)
+                self._wait_read(self._sock.fileno(), timeout)
             except OpenSSL.SSL.WantWriteError:
                 sys.exc_clear()
-                self.wait_write(self._sock.fileno(), timeout)
+                self._wait_write(self._sock.fileno(), timeout)
             except OpenSSL.SSL.SysCallError as e:
                 if e[0] == -1 and not data:
                     # errors when writing empty strings are expected and can be ignored
@@ -430,10 +430,10 @@ class SSLConnection(object):
                 return self._connection.recv(bufsiz, flags)
             except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
                 sys.exc_clear()
-                self.wait_read(self._sock.fileno(), timeout)
+                self._wait_read(self._sock.fileno(), timeout)
             except OpenSSL.SSL.WantWriteError:
                 sys.exc_clear()
-                self.wait_write(self._sock.fileno(), timeout)
+                self._wait_write(self._sock.fileno(), timeout)
             except OpenSSL.SSL.ZeroReturnError:
                 return ''
 
@@ -533,7 +533,7 @@ class PacUtil(object):
             logging.info('%r successfully updated', filename)
 
     @staticmethod
-    def autoproxy2pac(content, func_name='FindProxyForURLByAutoProxy', proxy='1127.0.0.1:1998', default='DIRECT', indent=4):
+    def autoproxy2pac(content, func_name='FindProxyForURLByAutoProxy', proxy='127.0.0.1:1998', default='DIRECT', indent=4):
         """Autoproxy to Pac, based on https://github.com/iamamac/autoproxy2pac"""
         jsLines = []
         for line in content.splitlines()[1:]:
@@ -567,7 +567,7 @@ class PacUtil(object):
         return function
 
     @staticmethod
-    def urlfilter2pac(content, func_name='FindProxyForURLByUrlfilter', proxy='1127.0.0.1:1999', default='DIRECT', indent=4):
+    def urlfilter2pac(content, func_name='FindProxyForURLByUrlfilter', proxy='127.0.0.1:1999', default='DIRECT', indent=4):
         """urlfilter.ini to Pac, based on https://github.com/iamamac/autoproxy2pac"""
         jsLines = []
         for line in content[content.index('[exclude]'):].splitlines()[1:]:
@@ -590,7 +590,7 @@ class PacUtil(object):
         return function
 
     @staticmethod
-    def adblock2pac(content, func_name='FindProxyForURLByAdblock', proxy='1127.0.0.1:1999', default='DIRECT', indent=4):
+    def adblock2pac(content, func_name='FindProxyForURLByAdblock', proxy='127.0.0.1:1999', default='DIRECT', indent=4):
         """adblock list to Pac, based on https://github.com/iamamac/autoproxy2pac"""
         jsLines = []
         for line in content.splitlines()[1:]:
@@ -1507,7 +1507,8 @@ def response_replace_header(response, name, value):
     else:
         response.header.replace_header(name, value)
 
-def rc4crypt(data, key): 
+
+def rc4crypt(data, key):
     """RC4 algorithm"""
     if not key or not data:
         return data
@@ -1560,6 +1561,7 @@ class RC4FileObject(object):
         self.__y = y
         return ''.join(out)
 
+
 try:
     from Crypto.Cipher._ARC4 import new as _Crypto_Cipher_ARC4_new
     def rc4crypt(data, key):
@@ -1568,12 +1570,12 @@ try:
         """fileobj for rc4"""
         def __init__(self, stream, key):
             self.__stream = stream
-            self.__cipher = _Crypto_Cipher_ARC4_(key)
+            self.__cipher = _Crypto_Cipher_ARC4_new(key) if key else lambda x:x
         def __getattr__(self, attr):
             if attr not in ('__stream', '__cipher'):
                 return getattr(self.__stream, attr)
         def read(self, size=-1):
-            return self.__cipher.encrypt(self.__stream.read(size)) if key else lambda x:x
+            return self.__cipher.encrypt(self.__stream.read(size))
 except ImportError:
     pass
 
