@@ -3,23 +3,36 @@
 # Based on GAppProxy 2.0.0 by Du XiaoGang <dugang.2008@gmail.com>
 # Based on WallProxy 0.4.0 by Hust Moon <www.ehust@gmail.com>
 # Contributor:
-#      Phus Lu        <phus.lu@gmail.com>
-#      Hewig Xu       <hewigovens@gmail.com>
-#      Ayanamist Yang <ayanamist@gmail.com>
-#      Max Lv         <max.c.lv@gmail.com>
-#      AlsoTang       <alsotang@gmail.com>
-#      Yonsm          <YonsmGuo@gmail.com>
-#      Ming Bai       <mbbill@gmail.com>
-#      Bin Yu         <yubinlove1991@gmail.com>
-#      Zhang Youfu    <zhangyoufu@gmail.com>
-#      Harmony Meow   <harmony.meow@gmail.com>
-#      logostream     <logostream@gmail.com>
-#      Felix Yan      <felixonmars@gmail.com>
-#      Mort Yao       <mort.yao@gmail.com>
-#      Wang Wei Qiang <wwqgtxx@gmail.com>
-#      Poly Rabbit    <mcx_221@foxmail.com>
+#      Phus Lu           <phus.lu@gmail.com>
+#      Hewig Xu          <hewigovens@gmail.com>
+#      Ayanamist Yang    <ayanamist@gmail.com>
+#      V.E.O             <V.E.O@tom.com>
+#      Max Lv            <max.c.lv@gmail.com>
+#      AlsoTang          <alsotang@gmail.com>
+#      Christopher Meng  <cickumqt@gmail.com>
+#      Yonsm Guo         <YonsmGuo@gmail.com>
+#      Parkman           <cseparkman@gmail.com>
+#      Ming Bai          <mbbill@gmail.com>
+#      Bin Yu            <yubinlove1991@gmail.com>
+#      lileixuan         <lileixuan@gmail.com>
+#      Cong Ding         <cong@cding.org>
+#      Zhang Youfu       <zhangyoufu@gmail.com>
+#      Lu Wei            <luwei@barfoo>
+#      Harmony Meow      <harmony.meow@gmail.com>
+#      logostream        <logostream@gmail.com>
+#      Rui Wang          <isnowfy@gmail.com>
+#      Wang Wei Qiang    <wwqgtxx@gmail.com>
+#      Felix Yan         <felixonmars@gmail.com>
+#      Sui Feng          <suifeng.me@qq.com>
+#      QXO               <qxodream@gmail.com>
+#      Geek An           <geekan@foxmail.com>
+#      Poly Rabbit       <mcx_221@foxmail.com>
+#      oxnz              <yunxinyi@gmail.com>
+#      Shusen Liu        <liushusen.smart@gmail.com>
+#      Yad Smood         <y.s.inside@gmail.com>
+#      Chen Shuang       <cs0x7f@gmail.com>
 
-__version__ = '3.0.5'
+__version__ = '3.0.7'
 
 import sys
 import os
@@ -892,7 +905,7 @@ class HTTPUtil(object):
             else:
                 iplist = DNSUtil.remote_resolve(dnsserver, host, timeout=2)
             if not iplist:
-                iplist = DNSUtil.remote_resolve('8.8.8.8', host, timeout=2)
+                iplist = DNSUtil.remote_resolve('8.8.4.4', host, timeout=2)
             if ipv4_only:
                 iplist = [ip for ip in iplist if re.match(r'\d+\.\d+\.\d+\.\d+', ip)]
             self.dns[host] = iplist = list(set(iplist))
@@ -1214,7 +1227,7 @@ class HTTPUtil(object):
         if crlf:
             need_crlf = 1
         if need_crlf:
-            request_data = 'GET / HTTP/1.1\r\n\r\n\r\n\r\n\r\r'
+            request_data = 'GET /%s HTTP/1.1\r\n\r\n\r\n\r\n\r\r' % ''.join(random.sample('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ', random.randint(1, 52)))
         else:
             request_data = ''
         request_data += '%s %s %s\r\n' % (method, path, protocol_version)
@@ -1547,6 +1560,23 @@ class RC4FileObject(object):
         self.__y = y
         return ''.join(out)
 
+try:
+    from Crypto.Cipher._ARC4 import new as _Crypto_Cipher_ARC4_new
+    def rc4crypt(data, key):
+        return _Crypto_Cipher_ARC4_new(key).encrypt(data) if key else data
+    class RC4FileObject(object):
+        """fileobj for rc4"""
+        def __init__(self, stream, key):
+            self.__stream = stream
+            self.__cipher = _Crypto_Cipher_ARC4_(key)
+        def __getattr__(self, attr):
+            if attr not in ('__stream', '__cipher'):
+                return getattr(self.__stream, attr)
+        def read(self, size=-1):
+            return self.__cipher.encrypt(self.__stream.read(size)) if key else lambda x:x
+except ImportError:
+    pass
+
 
 def gae_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
     # deflate = lambda x:zlib.compress(x)[2:-4]
@@ -1579,12 +1609,11 @@ def gae_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
         else:
             request_method = 'GET'
     else:
-        if 'rc4' in common.GAE_OPTIONS:
-            request_headers['X-GOA-Options'] = 'rc4'
-            metadata = rc4crypt(metadata, kwargs.get('password'))
-            payload = rc4crypt(payload, kwargs.get('password'))
         metadata = zlib.compress(metadata)[2:-4]
         payload = '%s%s%s' % (struct.pack('!h', len(metadata)), metadata, payload)
+        if 'rc4' in common.GAE_OPTIONS:
+            request_headers['X-GOA-Options'] = 'rc4'
+            payload = rc4crypt(payload, kwargs.get('password'))
         request_headers['Content-Length'] = str(len(payload))
     # post data
     need_crlf = 0 if common.GOOGLE_MODE == 'https' else common.GAE_CRLF
@@ -1665,7 +1694,8 @@ class RangeFetch(object):
         range_queue.put((start, end, self.response))
         for begin in range(end+1, length, self.maxsize):
             range_queue.put((begin, min(begin+self.maxsize-1, length-1), None))
-        any(thread.start_new_thread(self.__fetchlet, (range_queue, data_queue)) for _ in range(self.threads))
+        for _ in range(self.threads):
+            thread.start_new_thread(self.__fetchlet, (range_queue, data_queue))
         has_peek = hasattr(data_queue, 'peek')
         peek_timeout = 90
         expect_begin = start
@@ -1756,6 +1786,9 @@ class RangeFetch(object):
                     logging.info('>>>>>>>>>>>>>>> [thread %s] %s %s', threading.currentThread().ident, content_length, content_range)
                     while 1:
                         try:
+                            if self._stopped:
+                                response.close()
+                                return
                             data = response.read(self.bufsize)
                             if not data:
                                 break
@@ -1830,7 +1863,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 else:
                     google_ipmap[domain] = [domain]
             google_iplist = list(set(sum(list(google_ipmap.values()), [])))
-            if len(google_iplist) < 10 or len(set(x.split('.', 1)[0] for x in google_iplist)) == 1:
+            if len(google_iplist) < 20 or len(set(x.split('.', 1)[0] for x in google_iplist)) == 1:
                 logging.warning('local google_iplist=%s is too short, try remote_resolve', google_iplist)
                 need_resolve_remote += list(common.GOOGLE_HOSTS)
             for dnsserver in common.DNS_DNSSERVER:
@@ -2574,7 +2607,7 @@ def pre_start():
         logging.critical('please edit %s to add your appid to [gae] !', common.CONFIG_FILENAME)
         sys.exit(-1)
     if common.GOOGLE_MODE == 'http' and common.GAE_PROFILE != 'google_ipv6' and common.GAE_PASSWORD == '':
-        logging.critical('to enable http mode, you should set [gae]password = <your_pass> and [gae]options = rc4', common.CONFIG_FILENAME)
+        logging.critical('to enable http mode, you should set %r [gae]password = <your_pass> and [gae]options = rc4', common.CONFIG_FILENAME)
         sys.exit(-1)
     if common.PAC_ENABLE:
         pac_ip = ProxyUtil.get_listen_ip() if common.PAC_IP in ('', '::', '0.0.0.0') else common.PAC_IP
