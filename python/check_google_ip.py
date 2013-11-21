@@ -27,7 +27,6 @@ import ssl
 import socket
 import ConfigParser
 
-__config__   = 'proxy.ini'
 __file__     = 'check_google_ip.py'
 __filename__ = 'ip.txt'
 
@@ -39,7 +38,7 @@ class Common(object):
         """load config from proxy.ini"""
         ConfigParser.RawConfigParser.OPTCRE = re.compile(r'(?P<option>[^=\s][^=]*)\s*(?P<vi>[=])\s*(?P<value>.*)$')
         self.CONFIG = ConfigParser.ConfigParser()
-        self.CONFIG.read(os.path.join(os.path.dirname(__file__), __config__))
+        self.CONFIG.read(os.path.join(os.path.dirname(__file__)))
         self.IPS = []
 
 
@@ -78,21 +77,6 @@ class Common(object):
     def writeip(self,ip):
         self.write(ip)
         common.IPS.append(ip)
-
-    def writeips(self,section, option):
-        str_ips = ''
-        if self.IPS!=[]:
-            for item in self.IPS:
-                str_ips = str_ips+item
-            print str_ips
-            self.writeconfig(section, option,str_ips)
-            self.IPS = []
-
-    def writeconfig(self,section, option,str):
-        self.CONFIG.set(section,option,str)
-        f = open(self.getfile(__config__),'w') 
-        self.CONFIG.write(f)
-        f.close()
     
     def getconfig(self,section, option):
         return self.CONFIG.get(section, option)if self.CONFIG.has_option(section, option) else ''
@@ -108,7 +92,7 @@ class Check_ip(object):
                 sock = socket.create_connection((ip, 443))
                 ssl_sock = ssl.wrap_socket(sock)
                 peer_cert = ssl_sock.getpeercert(True)
-                if '.google.com' in peer_cert:
+                if 'google.com' in peer_cert:
                     print ip
                     self.ips.append(ip)
                     #print self.ips
@@ -149,7 +133,6 @@ def main():
     common.writeline()
     common.write('Google hk Ip:')
     common.writeline()
-    check_ip.run(__filename__,'173.194.',72,72)
     check_ip.run(__filename__,'173.194.',127,127)
     print 'Find Google Cn Ip Successful,Change To Google_cn'
    # else:
