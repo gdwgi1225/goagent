@@ -510,7 +510,7 @@ class PacUtil(object):
                 if 'gevent' in sys.modules and time.sleep is getattr(sys.modules['gevent'], 'sleep', None) and hasattr(gevent.get_hub(), 'threadpool'):
                     jsrule = gevent.get_hub().threadpool.apply(PacUtil.adblock2pac, (adblock_content, 'FindProxyForURLByAdblock', blackhole, default))
                 else:
-                    content += '\r\nfunction FindProxyForURLByAdblock(url, host) {return 'DIRECT';}\r\n'
+                    content += '\r\nfunction FindProxyForURLByAdblock(url, host) {return "DIRECT";}\r\n'
         except Exception as e:
             need_update = False
             logging.exception('update_pacfile failed: %r', e)
@@ -647,7 +647,7 @@ class PacUtil(object):
                     jsLine = 'if (host == "%s") return "%s";' % (line, return_proxy)
             elif use_domain:
                 if line.split('/')[0].count('.') <= 1:
-                    if use_postfix:+
+                    if use_postfix:
                         jsCondition = ' || '.join('shExpMatch(url, "http://*.%s*%s")' % (line, x) for x in use_postfix)
                         jsLine = 'if (%s) return "%s";' % (jsCondition, return_proxy)
                     else:
@@ -873,6 +873,7 @@ class HTTPUtil(object):
         self.max_timeout = max_timeout
         self.tcp_connection_time = collections.defaultdict(float)
         self.ssl_connection_time = collections.defaultdict(float)
+        self.ssl_connection_cache = collections.defaultdict(Queue.PriorityQueue)
         self.max_timeout = max_timeout
         self.dns = {}
         self.crlf = 0
@@ -1075,8 +1076,19 @@ class HTTPUtil(object):
                 if sock:
                     sock.close()
         def _close_ssl_connection(count, queobj):
-            for _ in range(count):
-                queobj.get()
+            for i in range(count):
+                sock = queobj.get()
+                if sock and not isinstance(sock, Exception):
+                    if i == 0:
+                        self.ssl_connection_cache[address].put((time.time(), sock))
+                    else:
+                        sock.close()
+        try:
+            ctime, sock = self.ssl_connection_cache[address].get_nowait()
+            if time.time() - ctime < 30:
+                return sock
+        except Queue.Empty:
+            pass
         host, port = address
         result = None
         # create_connection = _create_ssl_connection if not self.ssl_obfuscate and not self.ssl_validate else _create_openssl_connection
