@@ -133,7 +133,9 @@ def main():
     common.writeline()
     common.write('Google hk Ip:')
     common.writeline()
-    check_ip.run(__filename__,'173.194.',127,127)
+    check_ip.run(__filename__,'173.194.',72,72)
+    check_ip.run(__filename__,'173.194.',127,128)
+    check_ip.run(__filename__,'74.125.',127,128)
     print 'Find Google Cn Ip Successful,Change To Google_cn'
    # else:
    #     common.writeline()
