@@ -1862,7 +1862,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         if len(resolved_iplist) < 32 or len(set(x.split('.', 1)[0] for x in resolved_iplist)) == 1:
             logging.warning('local google_hosts=%s is too short, try remote_resolve', google_hosts)
             need_resolve_remote += [x for x in google_hosts if not re.match(r'\d+\.\d+\.\d+\.\d+', x)]
-        dnsserver = common.DNS_DNSSERVER
+        dnsservers = common.DNS_DNSSERVER
         result_queue = Queue.Queue()
         for host in need_resolve_remote:
             for dnsserver in dnsservers:
@@ -2576,6 +2576,52 @@ class DNSServer(gevent.server.DatagramServer if gevent and hasattr(gevent.server
         return self.sendto(data[:2] + reply_data[2:], address)
 
 
+def get_process_list():
+    import os
+    import glob
+    import ctypes
+    import collections
+    Process = collections.namedtuple('Process', 'pid name exe')
+    process_list = []
+    if os.name == 'nt':
+        PROCESS_QUERY_INFORMATION = 0x0400
+        PROCESS_VM_READ = 0x0010
+        lpidProcess= (ctypes.c_ulong * 1024)()
+        cb = ctypes.sizeof(lpidProcess)
+        cbNeeded = ctypes.c_ulong()
+        ctypes.windll.psapi.EnumProcesses(ctypes.byref(lpidProcess), cb, ctypes.byref(cbNeeded))
+        nReturned = cbNeeded.value/ctypes.sizeof(ctypes.c_ulong())
+        pidProcess = [i for i in lpidProcess][:nReturned]
+        has_queryimage = hasattr(ctypes.windll.kernel32, 'QueryFullProcessImageNameA')
+        for pid in pidProcess:
+            hProcess = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid)
+            if hProcess:
+                modname = ctypes.create_string_buffer(2048)
+                count = ctypes.c_ulong(ctypes.sizeof(modname))
+                if has_queryimage:
+                    ctypes.windll.kernel32.QueryFullProcessImageNameA(hProcess, 0, ctypes.byref(modname), ctypes.byref(count))
+                else:
+                    ctypes.windll.psapi.GetModuleFileNameExA(hProcess, 0, ctypes.byref(modname), ctypes.byref(count))
+                exe = modname.value
+                name = os.path.basename(exe)
+                process_list.append(Process(pid=pid, name=name, exe=exe))
+                ctypes.windll.kernel32.CloseHandle(hProcess)
+    elif sys.platform.startswith('linux'):
+        for filename in glob.glob('/proc/[0-9]*/cmdline'):
+            pid = int(filename.split('/')[2])
+            exe_link = '/proc/%d/exe' % pid
+            if os.path.exists(exe_link):
+                exe = os.readlink(exe_link)
+                name = os.path.basename(exe)
+                process_list.append(Process(pid=pid, name=name, exe=exe))
+    else:
+        try:
+            import psutil
+            process_list = psutil.get_process_list()
+        except Exception as e:
+            logging.exception('psutil.get_process_list() failed: %r', e)
+    return process_list
+
 def pre_start():
     if sys.platform == 'cygwin':
         logging.info('cygwin is not officially supported, please continue at your own risk :)')
@@ -2601,8 +2647,8 @@ def pre_start():
                      'QQProtect': False, }
         softwares = [k for k, v in blacklist.items() if v]
         if softwares:
-            tasklist = os.popen('tasklist').read().lower()
-            softwares = [x for x in softwares if x.lower()in tasklist]
+            tasklist = '\n'.join(x.name for x in get_process_list()).lower()
+            softwares = [x for x in softwares if x.lower() in tasklist]
             if softwares:
                 title = u'GoAgent 建议'
                 error = u'某些安全软件(如 %s)可能和本软件存在冲突，造成 CPU 占用过高。\n如有此现象建议暂时退出此安全软件来继续运行GoAgent' % ','.join(softwares)
