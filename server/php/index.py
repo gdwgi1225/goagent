@@ -7,9 +7,17 @@ __hostsdeny__ = ()  # __hostsdeny__ = ('.youtube.com', '.youku.com')
 __content_type__ = 'image/gif'
 __timeout__ = 20
 
+try:
+    import gevent
+    import gevent.queue
+    import gevent.monkey
+    gevent.monkey.patch_all()
+except ImportError:
+    pass
 
 import sys
 import re
+import time
 import itertools
 import functools
 import logging
@@ -18,7 +26,10 @@ import urlparse
 import httplib
 import struct
 import zlib
+import collections
+import Queue
 
+normcookie = functools.partial(re.compile(', ([^ =]+(?:=|$))').sub, '\\r\\nSet-Cookie: \\1')
 
 def message_html(title, banner, detail=''):
     MESSAGE_TEMPLATE = '''
@@ -61,78 +72,97 @@ class XORCipher(object):
         return ''.join(chr(ord(x) ^ self.__key_gen()) for x in data)
 
 
+def decode_request(data):
+    metadata_length, = struct.unpack('!h', data[:2])
+    metadata = zlib.decompress(data[2:2+metadata_length], -zlib.MAX_WBITS)
+    body = data[2+metadata_length:]
+    headers = dict(x.split(':', 1) for x in metadata.splitlines() if x)
+    method = headers.pop('G-Method')
+    url = headers.pop('G-Url')
+    kwargs = {}
+    any(kwargs.__setitem__(x[2:].lower(), headers.pop(x)) for x in headers.keys() if x.startswith('G-'))
+    if headers.get('Content-Encoding', '') == 'deflate':
+        body = zlib.decompress(body, -zlib.MAX_WBITS)
+        headers['Content-Length'] = str(len(body))
+        del headers['Content-Encoding']
+    return method, url, headers, kwargs, body
+
+
+QUEUE_MODULE = __import__('gevent.queue', fromlist=['.']) if 'gevent.wsi' in sys.modules else Queue
+HTTP_CONNECTION_CACHE = collections.defaultdict(QUEUE_MODULE.PriorityQueue)
+
 def application(environ, start_response):
     if environ['REQUEST_METHOD'] == 'GET':
         start_response('302 Found', [('Location', 'https://www.google.com')])
         raise StopIteration
 
-    wsgi_input = environ['wsgi.input']
-    input_data = wsgi_input.read(int(environ.get('CONTENT_LENGTH') or -1))
-
-    metadata_length, = struct.unpack('!h', input_data[:2])
-    metadata = zlib.decompress(input_data[2:2+metadata_length], -zlib.MAX_WBITS)
-    payload = input_data[2+metadata_length:]
-    headers = dict(x.split(':', 1) for x in metadata.splitlines() if x)
-    method = headers.pop('G-Method')
-    url = headers.pop('G-Url')
-    urlparts = urlparse.urlparse(url)
-
-    kwargs = {}
-    any(kwargs.__setitem__(x[2:].lower(), headers.pop(x)) for x in headers.keys() if x.startswith('G-'))
-
-    if 'Content-Encoding' in headers:
-        if headers['Content-Encoding'] == 'deflate':
-            payload = zlib.decompress(payload, -zlib.MAX_WBITS)
-            headers['Content-Length'] = str(len(payload))
-            del headers['Content-Encoding']
-
+    post_data = environ['wsgi.input'].read(int(environ.get('CONTENT_LENGTH') or -1))
+    method, url, headers, kwargs, body = decode_request(post_data)
+    scheme, netloc, path, _, query, _ = urlparse.urlparse(url)
     cipher = XORCipher(__password__[0])
-    normcookie = functools.partial(re.compile(', ([^ =]+(?:=|$))').sub, '\\r\\nSet-Cookie: \\1')
 
-    if __password__ and __password__ != kwargs.get('password'):
+    if __password__ != kwargs.get('password'):
         start_response('403 Forbidden', [('Content-Type', 'text/html')])
         yield message_html('403 Wrong Password', 'Wrong Password(%s)' % kwargs.get('password'), detail='please edit proxy.ini')
         raise StopIteration
 
-    if __hostsdeny__ and urlparts.netloc.endswith(__hostsdeny__):
+    if __hostsdeny__ and netloc.endswith(__hostsdeny__):
         start_response('200 OK', [('Content-Type', __content_type__)])
         yield cipher.encrypt('HTTP/1.1 403 Forbidden\r\nContent-type: text/html\r\n\r\n')
-        yield cipher.encrypt(message_html('403 Forbidden Host', 'Hosts Deny(%s)' % urlparts.netloc, detail='url=%r' % url))
+        yield cipher.encrypt(message_html('403 Forbidden Host', 'Hosts Deny(%s)' % netloc, detail='url=%r' % url))
         raise StopIteration
 
+    timeout = int(kwargs.get('timeout') or __timeout__)
+    fetchmax = int(kwargs.get('fetchmax') or 3)
+    ConnectionType = httplib.HTTPSConnection if scheme == 'https' else httplib.HTTPConnection
     header_sent = False
     try:
-        timeout = int(kwargs.get('timeout') or __timeout__)
-        ConnectionType = httplib.HTTPSConnection if urlparts.scheme == 'https' else httplib.HTTPConnection
-        conn = ConnectionType(urlparts.netloc, timeout=timeout)
-        path = urlparts.path
-        if urlparts.query:
-            path += '?' + urlparts.query
-        conn.request(method, path, body=payload, headers=headers)
-        response = conn.getresponse()
+        connection = None
+        response = None
+        for i in xrange(fetchmax):
+            try:
+                while True:
+                    try:
+                        mtime, connection = HTTP_CONNECTION_CACHE[(scheme, netloc)].get_nowait()
+                        if time.time() - mtime < 16:
+                            break
+                        else:
+                            connection.close()
+                    except Queue.Empty:
+                        connection = ConnectionType(netloc, timeout=timeout)
+                        break
+                connection.request(method, '%s?%s' % (path, query) if query else path, body=body, headers=headers)
+                response = connection.getresponse(buffering=True)
+                break
+            except Exception as e:
+                if i == fetchmax - 1:
+                    raise
         start_response('200 OK', [('Content-Type', __content_type__)])
         header_sent = True
         if response.getheader('Set-Cookie'):
             response.msg['Set-Cookie'] = normcookie(response.getheader('Set-Cookie'))
         yield cipher.encrypt('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding')))
         while True:
-            data = response.read()
+            data = response.read(8192)
             if not data:
+                response.close()
+                HTTP_CONNECTION_CACHE[(scheme, netloc)].put((time.time(), connection))
                 return
             yield cipher.encrypt(data)
     except Exception as e:
+        import traceback
         if not header_sent:
             start_response('200 OK', [('Content-Type', __content_type__)])
         yield cipher.encrypt('HTTP/1.1 500 Internal Server Error\r\nContent-type: text/html\r\n\r\n')
-        yield cipher.encrypt(message_html('500 Internal Server Error', 'urlfetch %r failed' % url, detail=repr(e)))
+        yield cipher.encrypt(message_html('500 Internal Server Error', 'urlfetch %r: %r' % (url, e), '<pre>%s</pre>' % traceback.format_exc()))
         raise StopIteration
-
 
 try:
     import sae
-    application = sae.create_wsgi_app(app)
+    application = sae.create_wsgi_app(application)
 except ImportError:
     pass
+
 try:
     import bae.core.wsgi
     application = bae.core.wsgi.WSGIApplication(application)
@@ -140,11 +170,22 @@ except ImportError:
     pass
 
 
+def run_wsgi_app(address, app):
+    if 'gevent' in sys.modules:
+        from gevent.wsgi import WSGIServer
+        return WSGIServer(address, app).serve_forever()
+    else:
+        from gunicorn.app.base import Application
+        class GunicornApplication(Application):
+            def init(self, parser, opts, args):
+                return {'bind': '%s:%d' % address}
+            def load(self):
+                return application
+        GunicornApplication().run()
+
+
 if __name__ == '__main__':
-    import gevent.monkey
-    import gevent.wsgi
-    gevent.monkey.patch_all()
     logging.basicConfig(level=logging.INFO, format='%(levelname)s - - %(asctime)s %(message)s', datefmt='[%b %d %H:%M:%S]')
-    server = gevent.wsgi.WSGIServer(('', int(sys.argv[1])), application)
-    logging.info('local paas_application serving at %s:%s', server.address[0], server.address[1])
-    server.serve_forever()
+    host, _, port = sys.argv[1].rpartition(':')
+    logging.info('local paas_application serving at %s:%s', host, port)
+    run_wsgi_app((host, int(port)), application)
