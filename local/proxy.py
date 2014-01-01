@@ -92,6 +92,10 @@ try:
     import dnslib
 except ImportError:
     dnslib = None
+try:
+    import pacparser
+except ImportError:
+    pacparser = None
 
 
 HAS_PYPY = hasattr(sys, 'pypy_version_info')
@@ -174,6 +178,37 @@ class Logging(type(sys)):
         self.log('CRITICAL', fmt, *args, **kwargs)
         self.__reset_color()
 logging = sys.modules['logging'] = Logging('logging')
+
+
+class LRUCache(object):
+    """http://pypi.python.org/pypi/lru/"""
+
+    def __init__(self, max_items=100):
+        self.cache = {}
+        self.key_order = []
+        self.max_items = max_items
+
+    def __setitem__(self, key, value):
+        self.cache[key] = value
+        self._mark(key)
+
+    def __getitem__(self, key):
+        value = self.cache[key]
+        self._mark(key)
+        return value
+
+    def _mark(self, key):
+        if key in self.key_order:
+            self.key_order.remove(key)
+        self.key_order.insert(0, key)
+        if len(self.key_order) > self.max_items:
+            remove = self.key_order[self.max_items]
+            del self.cache[remove]
+            self.key_order.pop(self.max_items)
+
+    def clear(self):
+        self.cache = {}
+        self.key_order = []
 
 
 class CertUtil(object):
@@ -1194,8 +1229,6 @@ class HTTPUtil(object):
             logging.error('__create_ssl_connection_withproxy error %s', e)
             raise
 
-
-
     def forward_socket(self, local, remote, timeout=60, tick=2, bufsize=8192, maxping=None, maxpong=None):
         try:
             timecount = timeout
@@ -1260,7 +1293,7 @@ class HTTPUtil(object):
         else:
             request_data = ''
         request_data += '%s %s %s\r\n' % (method, path, protocol_version)
-        request_data += ''.join('%s: %s\r\n' % (k, v) for k, v in headers.items() if k not in skip_headers)
+        request_data += ''.join('%s: %s\r\n' % (k.title(), v) for k, v in headers.items() if k.title() not in skip_headers)
         if self.proxy:
             _, username, password, _ = ProxyUtil.parse_proxy(self.proxy)
             if username and password:
@@ -1291,10 +1324,7 @@ class HTTPUtil(object):
         if return_sock:
             return sock
 
-        if sys.hexversion > 0x2070000:
-            response = httplib.HTTPResponse(sock, buffering=True)
-        else:
-            response = httplib.HTTPResponse(sock)
+        response = httplib.HTTPResponse(sock, buffering=True)
         try:
             response.begin()
         except httplib.BadStatusLine:
@@ -1547,6 +1577,7 @@ class Common(object):
         if common.PAC_ENABLE:
             info += 'Pac Server         : http://%s:%d/%s\n' % (self.PAC_IP, self.PAC_PORT, self.PAC_FILE)
             info += 'Pac File           : file://%s\n' % os.path.join(os.path.dirname(os.path.abspath(__file__)), self.PAC_FILE).replace('\\', '/')
+            info += 'Pac Parser Version : %s\n' % pacparser.version() if pacparser else ''
         if common.PHP_ENABLE:
             info += 'PHP Listen         : %s\n' % common.PHP_LISTEN
             info += 'PHP FetchServer    : %s\n' % common.PHP_FETCHSERVER
@@ -2072,7 +2103,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         except NetWorkIOError as e:
             if e.args[0] in (errno.ECONNRESET, 10063, errno.ENAMETOOLONG):
                 logging.warn('http_util.request "%s %s" failed:%s, try addto `withgae`', self.command, self.path, e)
-                common.HTTP_WITHGAE = tuple(list(common.HTTP_WITHGAE)+[re.sub(r':\d+$', '', self.url_parts.netloc)])
+                common.HTTP_WITHGAE.add(re.sub(r':\d+$', '', self.url_parts.netloc))
             elif e.args[0] not in (errno.ECONNABORTED, errno.EPIPE):
                 raise
         except Exception as e:
@@ -2479,28 +2510,86 @@ class PHPProxyHandler(GAEProxyHandler):
                 raise
 
 
-class PACServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
+class PACProxyHandler(GAEProxyHandler):
 
+    localhosts = ('127.0.0.1', ProxyUtil.get_listen_ip(), 'localhost')
+    first_run_lock = threading.Lock()
     pacfile = os.path.join(os.path.dirname(os.path.abspath(__file__)), common.PAC_FILE)
-    onepixel = b'GIF89a\x01\x00\x01\x00\x80\xff\x00\xc0\xc0\xc0\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;'
+    pacfile_mtime = os.path.getmtime(pacfile)
+    pacparser_lrucache = LRUCache(4096)
 
-    def address_string(self):
-        return '%s:%s' % self.client_address[:2]
+    def first_run(self):
+        if pacparser:
+            pacparser.init()
+            pacparser.parse_pac_file(self.pacfile)
+            threading._start_new_thread(self.__pacparser_update)
+        return True
+
+    def setup(self):
+        if isinstance(self.__class__.first_run, collections.Callable):
+            try:
+                with self.__class__.first_run_lock:
+                    if isinstance(self.__class__.first_run, collections.Callable):
+                        self.first_run()
+                        self.__class__.first_run = None
+            except Exception as e:
+                logging.exception('GAEProxyHandler.first_run() return %r', e)
+        self.__class__.setup = BaseHTTPServer.BaseHTTPRequestHandler.setup
+        self.__class__.do_GET = self.__class__.do_METHOD
+        self.__class__.do_PUT = self.__class__.do_METHOD
+        self.__class__.do_POST = self.__class__.do_METHOD
+        self.__class__.do_HEAD = self.__class__.do_METHOD
+        self.__class__.do_DELETE = self.__class__.do_METHOD
+        self.__class__.do_OPTIONS = self.__class__.do_METHOD
+        self.setup()
+
+    def __pacparser_update(self):
+        while True:
+            try:
+                time.sleep(300)
+                mtime = os.path.getmtime(self.pacfile)
+                if mtime > self.__class__.pacfile_mtime:
+                    logging.info('%r updated, parse it')
+                    pacparser.parse_pac_file(self.pacfile)
+                    self.__class__.pacfile_mtime = mtime
+                    self.pacparser_lrucache.clear()
+            except Exception as e:
+                logging.exception('pacparser %r update error: %r', self.pacfile, e)
+                time.sleep(600)
+
+    def find_proxy_with_lrucache(self, url):
+        try:
+            return self.pacparser_lrucache[url]
+        except KeyError:
+            self.pacparser_lrucache[url] = pac_proxy = pacparser.find_proxy(url)
+            return pac_proxy
 
     def do_CONNECT(self):
-        self.wfile.write(b'HTTP/1.1 403\r\nConnection: close\r\n\r\n')
+        if not pacparser:
+            self.wfile.write(b'HTTP/1.1 403 Forbidden\r\n\r\n')
+            return
+        pac_proxy = self.find_proxy_with_lrucache('https://%s/' % self.path.rpartition(':')[0])
+        if pac_proxy == 'DIRECT':
+            return self.do_CONNECT_FWD()
+        else:
+            return GAEProxyHandler.do_CONNECT(self)
 
-    def do_GET(self):
-        filename = os.path.normpath('./' + urlparse.urlparse(self.path).path)
-        if self.path.startswith(('http://', 'https://')):
-            data = b'HTTP/1.1 200\r\nCache-Control: max-age=86400\r\nExpires:Oct, 01 Aug 2100 00:00:00 GMT\r\nConnection: close\r\n'
-            if filename.endswith(('.jpg', '.gif', '.jpeg', '.bmp')):
-                data += b'Content-Type: image/gif\r\n\r\n' + self.onepixel
+    def do_METHOD(self):
+        if self.path[0] == '/':
+            host = self.headers.getheader('Host')
+            if not host or host.startswith(self.localhosts):
+                return self.do_METHOD_LOCAL()
             else:
-                data += b'\r\n'
-            self.wfile.write(data)
+                self.path = 'http://%s%s' % (host, self.path)
+        if pacparser:
+            return GAEProxyHandler.do_METHOD(self)
+        else:
+            return self.do_METHOD_BLACKHOLE()
+
+    def do_METHOD_LOCAL(self):
+        filename = os.path.normpath('./' + urlparse.urlparse(self.path).path)
+        if os.path.isfile(filename):
             logging.info('%s "%s %s HTTP/1.1" 200 -', self.address_string(), self.command, self.path)
-        elif os.path.isfile(filename):
             if filename.endswith('.pac'):
                 mimetype = 'text/plain'
             else:
@@ -2509,19 +2598,40 @@ class PACServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 thread.start_new_thread(PacUtil.update_pacfile, (self.pacfile,))
             elif time.time() - os.path.getmtime(self.pacfile) > common.PAC_EXPIRED:
                 thread.start_new_thread(lambda: os.utime(self.pacfile, (time.time(), time.time())) or PacUtil.update_pacfile(self.pacfile), tuple())
-            self.send_file(filename, mimetype)
+            with open(filename, 'rb') as fp:
+                data = fp.read()
+                self.wfile.write(('HTTP/1.1 200\r\nContent-Type: %s\r\nContent-Length: %s\r\n\r\n' % (mimetype, len(data))).encode())
+                self.wfile.write(data)
         else:
-            self.wfile.write(b'HTTP/1.1 404\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n404 Not Found')
             logging.info('%s "%s %s HTTP/1.1" 404 -', self.address_string(), self.command, self.path)
+            self.wfile.write(b'HTTP/1.1 404\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n404 Not Found')
 
-    def send_file(self, filename, mimetype):
-        logging.info('%s "%s %s HTTP/1.1" 200 -', self.address_string(), self.command, self.path)
-        data = ''
-        with open(filename, 'rb') as fp:
-            data = fp.read()
-        if data:
-            self.wfile.write(('HTTP/1.1 200\r\nContent-Type: %s\r\nContent-Length: %s\r\n\r\n' % (mimetype, len(data))).encode())
-            self.wfile.write(data)
+    def do_METHOD_BLACKHOLE(self):
+        content = 'HTTP/1.1 200\r\n'\
+                  'Cache-Control: max-age=86400\r\n'\
+                  'Expires:Oct, 01 Aug 2100 00:00:00 GMT\r\n'\
+                  'Connection: close\r\n'
+        if urlparse.urlparse(self.path).path.endswith(('.jpg', '.gif', '.jpeg', '.bmp')):
+            content += 'Content-Type: image/gif\r\n\r\n'\
+                       'GIF89a\x01\x00\x01\x00\x80\xff\x00\xc0\xc0\xc0\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;'
+        else:
+            content += '\r\n'
+        self.wfile.write(content)
+
+    def do_METHOD_AGENT(self):
+        pac_proxy = self.find_proxy_with_lrucache(self.path)
+        if pac_proxy == 'DIRECT' and re.sub(r':\d+$', '', self.url_parts.netloc) not in common.HTTP_WITHGAE:
+            return self.do_METHOD_FWD()
+        elif pac_proxy.startswith('PROXY '):
+            host, _, port = pac_proxy.split()[1].rpartition(':')
+            if host in self.localhosts and int(port) == common.PAC_PORT:
+                return self.do_METHOD_BLACKHOLE()
+            elif host in self.localhosts and int(port) == common.LISTEN_PORT:
+                return GAEProxyHandler.do_METHOD_AGENT(self)
+            else:
+                return self.do_METHOD_FWD()
+        else:
+            GAEProxyHandler.do_METHOD_AGENT(self)
 
 
 class DNSServer(gevent.server.DatagramServer if gevent and hasattr(gevent.server, 'DatagramServer') else object):
@@ -2577,7 +2687,7 @@ class DNSServer(gevent.server.DatagramServer if gevent and hasattr(gevent.server
 
     def __init__(self, *args, **kwargs):
         super(DNSServer, self).__init__(*args, **kwargs)
-        self.dns_cache = {}
+        self.dns_cache = LRUCache(4096)
 
     def _dns_resolver(self, qname, qtype, qdata, dnsserver, result_queue):
         sock = gevent.socket.socket(socket.AF_INET6 if qtype == dnslib.QTYPE.AAAA else socket.AF_INET, socket.SOCK_DGRAM)
@@ -2598,9 +2708,10 @@ class DNSServer(gevent.server.DatagramServer if gevent and hasattr(gevent.server
         request = dnslib.DNSRecord.parse(data)
         qname = str(request.q.qname)
         qtype = request.q.qtype
-        if len(self.dns_cache) > self.max_cache_size:
-            self.dns_cache.clear()
-        reply_data = self.dns_cache.get((qname, qtype))
+        try:
+            reply_data = self.dns_cache[qname, qtype]
+        except KeyError:
+            reply_data = ''
         if not reply_data:
             result_queue = gevent.queue.Queue()
             for dnsserver in self.dnsservers:
@@ -2608,7 +2719,7 @@ class DNSServer(gevent.server.DatagramServer if gevent and hasattr(gevent.server
             while True:
                 try:
                     data = result_queue.get(timeout=self.timeout)
-                    reply_data = self.dns_cache[(qname, qtype)] = data
+                    self.dns_cache[qname, qtype] = reply_data = data
                     break
                 except gevent.queue.Empty:
                     logging.warning('query %r timed out', qname)
@@ -2732,7 +2843,7 @@ def main():
         thread.start_new_thread(server.serve_forever, tuple())
 
     if common.PAC_ENABLE:
-        server = LocalProxyServer((common.PAC_IP, common.PAC_PORT), PACServerHandler)
+        server = LocalProxyServer((common.PAC_IP, common.PAC_PORT), PACProxyHandler)
         thread.start_new_thread(server.serve_forever, tuple())
 
     if common.DNS_ENABLE:
