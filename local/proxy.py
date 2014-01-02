@@ -1989,6 +1989,19 @@ def expand_google_hk_iplist(domains, max_count=100):
     logging.info('expand_google_hk_iplist end. iplist=%s', ip_connection_time)
 
 
+def pipe_response_to_queue(response, queueobj, bufsize=8192):
+    try:
+        while True:
+            data = response.read(bufsize)
+            if not data:
+                queueobj.put(StopIteration)
+                break
+            queueobj.put(data)
+    except Exception as e:
+        logging.info('pipe_response error: %r', e)
+        queueobj.put(e)
+
+
 class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
     bufsize = 256*1024
@@ -2094,10 +2107,13 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             if response.status in (400, 405):
                 common.GAE_CRLF = 0
             self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
-            while 1:
-                data = response.read(8192)
-                if not data:
-                    break
+            queue = Queue.Queue()
+            threading._start_new_thread(pipe_response_to_queue, (response, queue, 8192))
+            while True:
+                data = queue.get()
+                if data is StopIteration or isinstance(data, Exception):
+                    response.close()
+                    return
                 self.wfile.write(data)
             response.close()
         except NetWorkIOError as e:
@@ -2217,9 +2233,11 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     start, end, length = tuple(int(x) for x in re.search(r'bytes (\d+)-(\d+)/(\d+)', content_range).group(1, 2, 3))
                 else:
                     start, end, length = 0, content_length-1, content_length
-                while 1:
-                    data = response.read(8192)
-                    if not data:
+                queue = Queue.Queue()
+                threading._start_new_thread(pipe_response_to_queue, (response, queue, 8192))
+                while True:
+                    data = queue.get()
+                    if data is StopIteration or isinstance(data, Exception):
                         response.close()
                         return
                     start += len(data)
@@ -2395,7 +2413,8 @@ def php_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
     app_payload = b''.join((struct.pack('!h', len(metadata)), metadata, payload))
     fetchserver += '?%s' % random.random()
     crlf = 0 if fetchserver.startswith('https') else common.PHP_CRLF
-    response = http_util.request('POST', fetchserver, app_payload, {'Content-Length': len(app_payload)}, crlf=crlf)
+    connection_cache_key = '%s//:%s' % urlparse.urlparse(fetchserver)[:2]
+    response = http_util.request('POST', fetchserver, app_payload, {'Content-Length': len(app_payload)}, crlf=crlf, connection_cache_key=connection_cache_key)
     if not response:
         raise socket.error(errno.ECONNRESET, 'urlfetch %r return None' % url)
     response.app_status = response.status
@@ -2495,15 +2514,16 @@ class PHPProxyHandler(GAEProxyHandler):
                 self.wfile.write('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k, v) for k, v in response.getheaders())))
 
             cipher = response.status == 200 and response.getheader('Content-Type', '') == 'image/gif' and XORCipher(common.PHP_PASSWORD[0])
-            while 1:
-                data = response.read(8192)
-                if not data:
+            queue = Queue.Queue()
+            threading._start_new_thread(pipe_response_to_queue, (response, queue, 8192))
+            while True:
+                data = queue.get()
+                if data is StopIteration or isinstance(data, Exception):
+                    response.close()
                     break
                 if cipher:
                     data = cipher.encrypt(data)
                 self.wfile.write(data)
-            response.close()
-
         except NetWorkIOError as e:
             # Connection closed before proxy return
             if e.args[0] not in (errno.ECONNABORTED, errno.EPIPE):
