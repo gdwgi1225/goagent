@@ -35,7 +35,7 @@
 #      cuixin            <steven.cuixin@gmail.com>
 #      s2marine0         <s2marine0@gmail.com>
 
-__version__ = '3.1.2'
+__version__ = '3.1.4'
 
 import sys
 import os
@@ -1344,7 +1344,8 @@ class HTTPUtil(object):
         else:
             host, _, port = netloc.rpartition(':')
             port = int(port)
-        path += '?' + query
+        if query:
+            path += '?' + query
 
         if 'Host' not in headers:
             headers['Host'] = host
@@ -2141,13 +2142,10 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             if response.status in (400, 405):
                 common.GAE_CRLF = 0
             self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
-            queue = Queue.Queue()
-            threading._start_new_thread(pipe_response_to_queue, (response, queue, 8192))
             while True:
-                data = queue.get()
-                if data is StopIteration or isinstance(data, Exception):
-                    response.close()
-                    return
+                data = response.read(8192)
+                if not data:
+                    break
                 self.wfile.write(data)
             response.close()
         except NetWorkIOError as e:
@@ -2269,11 +2267,9 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     start, end, length = tuple(int(x) for x in re.search(r'bytes (\d+)-(\d+)/(\d+)', content_range).group(1, 2, 3))
                 else:
                     start, end, length = 0, content_length-1, content_length
-                queue = Queue.Queue()
-                threading._start_new_thread(pipe_response_to_queue, (response, queue, 8192))
                 while True:
-                    data = queue.get()
-                    if data is StopIteration or isinstance(data, Exception):
+                    data = response.read(8192)
+                    if not data:
                         response.close()
                         return
                     start += len(data)
@@ -2550,11 +2546,9 @@ class PHPProxyHandler(GAEProxyHandler):
                 self.wfile.write('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k, v) for k, v in response.getheaders())))
 
             cipher = response.status == 200 and response.getheader('Content-Type', '') == 'image/gif' and XORCipher(common.PHP_PASSWORD[0])
-            queue = Queue.Queue()
-            threading._start_new_thread(pipe_response_to_queue, (response, queue, 8192))
             while True:
-                data = queue.get()
-                if data is StopIteration or isinstance(data, Exception):
+                data = response.read(8192)
+                if not data:
                     response.close()
                     break
                 if cipher:
@@ -2639,7 +2633,7 @@ class PACProxyHandler(GAEProxyHandler):
     def do_METHOD(self):
         if self.path[0] == '/':
             host = self.headers.getheader('Host')
-            if not host or host.startswith(self.localhosts):
+            if not pacparser or not host or host.startswith(self.localhosts):
                 return self.do_METHOD_LOCAL()
             else:
                 self.path = 'http://%s%s' % (host, self.path)
