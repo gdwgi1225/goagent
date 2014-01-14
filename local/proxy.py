@@ -931,7 +931,6 @@ class HTTPUtil(object):
         self.tcp_connection_cache = collections.defaultdict(Queue.PriorityQueue)
         self.ssl_connection_time = collections.defaultdict(float)
         self.ssl_connection_cache = collections.defaultdict(Queue.PriorityQueue)
-        self.max_timeout = max_timeout
         self.dns = {}
         self.proxy = proxy
         self.ssl_validate = ssl_validate or self.ssl_validate
@@ -1027,7 +1026,7 @@ class HTTPUtil(object):
         for i in range(self.max_retry):
             window = min((self.max_window+1)//2 + i, len(addresses))
             addresses.sort(key=get_connection_time)
-            addrs = addresses[:window] + random.sample(addresses, window)
+            addrs = addresses[:window] + random.sample(addresses, min(window, self.max_window-window))
             queobj = Queue.Queue()
             for addr in addrs:
                 thread.start_new_thread(_create_connection, (addr, timeout, queobj))
@@ -1174,7 +1173,7 @@ class HTTPUtil(object):
         for i in range(self.max_retry):
             window = min((self.max_window+1)//2 + i, len(addresses))
             addresses.sort(key=self.ssl_connection_time.__getitem__)
-            addrs = addresses[:window] + random.sample(addresses, window)
+            addrs = addresses[:window] + random.sample(addresses, min(window, self.max_window-window))
             queobj = Queue.Queue()
             for addr in addrs:
                 thread.start_new_thread(create_connection, (addr, timeout, queobj))
@@ -2259,7 +2258,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 errors.append(e)
                 if response:
                     response.close()
-                if e.args[0] in (errno.ECONNABORTED, errno.EPIPE):
+                if e.args[0] in (0, errno.ECONNABORTED, errno.EPIPE):
                     logging.debug('GAEProxyHandler.do_METHOD_AGENT return %r', e)
                 elif e.args[0] in (errno.ECONNRESET, errno.ETIMEDOUT, errno.ENETUNREACH, 11004):
                     # connection reset or timeout, switch to https
