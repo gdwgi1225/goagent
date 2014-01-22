@@ -44,6 +44,7 @@ import glob
 
 sys.dont_write_bytecode = True
 sys.path += glob.glob('%s/*.egg' % os.path.dirname(os.path.abspath(__file__)))
+from random import shuffle
 
 try:
     import gevent
@@ -2762,6 +2763,18 @@ def pre_start():
         logging.info('Uvent enabled, patch forward_socket')
         http_util.forward_socket = http_util.green_forward_socket
 
+class gfanqiang():      
+    def updateappid(self):
+        while(1):
+            appid = common.GAE_APPIDS
+            shuffle(appid)
+            logging.info("APPID:%s, GAE List %sG BW Remaning" % (common.GAE_APPIDS[1],len(appid)))
+            gevent.sleep(300)
+    def ping(self):
+            pass
+
+gfq = gfanqiang()
+
 
 def main():
     global __file__
@@ -2792,6 +2805,8 @@ def main():
         except ImportError:
             logging.critical('GoAgent DNSServer requires dnslib and gevent 1.0')
             sys.exit(-1)
+
+    gevent.spawn(gfq.updateappid)
 
     server = LocalProxyServer((common.LISTEN_IP, common.LISTEN_PORT), GAEProxyHandler)
     server.serve_forever()
