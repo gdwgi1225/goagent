@@ -2768,7 +2768,9 @@ class gfanqiang():
         while(1):
             appid = common.GAE_APPIDS
             shuffle(appid)
-            logging.info("APPID:%s, GAE List %sG BW Remaning" % (common.GAE_APPIDS[1],len(appid)))
+            logging.info("APPID: %s , GAE List %sG BW Remaning" % (appid[1],len(appid)))
+            common.GAE_APPIDS = appid
+            get_fetchserver = lambda i: '%s://%s.appspot.com%s?' % (common.GAE_MODE, common.GAE_APPIDS[i] if i is not None else random.choice(common.GAE_APPIDS), common.GAE_PATH)
             gevent.sleep(300)
     def ping(self):
             pass
