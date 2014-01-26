@@ -746,7 +746,7 @@ def dns_remote_resolve(qname, dnsservers, blacklist, timeout):
     http://zh.wikipedia.org/wiki/域名服务器缓存污染
     http://support.microsoft.com/kb/241352
     """
-    query = dnslib.DNSRecord(q=dnslib.DNSQuestion(qname=qname))
+    query = dnslib.DNSRecord(q=dnslib.DNSQuestion(qname))
     query_data = query.pack()
     dns_v4_servers = [x for x in dnsservers if ':' not in x]
     dns_v6_servers = [x for x in dnsservers if ':' in x]
@@ -758,6 +758,7 @@ def dns_remote_resolve(qname, dnsservers, blacklist, timeout):
     if dns_v6_servers:
         sock_v6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
         socks.append(sock_v6)
+    timeout_at = time.time() + timeout
     try:
         for _ in xrange(2):
             try:
@@ -765,22 +766,19 @@ def dns_remote_resolve(qname, dnsservers, blacklist, timeout):
                     sock_v4.sendto(query_data, (dnsserver, 53))
                 for dnsserver in dns_v6_servers:
                     sock_v6.sendto(query_data, (dnsserver, 53))
-                with gevent.timeout.Timeout(timeout):
-                    while True:
-                        ins, _, _ = select.select(socks, [], [], 0.1)
-                        for sock in ins:
-                            reply_data, _ = sock.recvfrom(512)
-                            reply = dnslib.DNSRecord.parse(reply_data)
-                            iplist = [str(x.rdata) for x in reply.rr if x.rtype == 1]
-                            if any(x in blacklist for x in iplist):
-                                logging.warning('query qname=%r reply bad iplist=%r', qname, iplist)
-                            else:
-                                logging.debug('query qname=%r reply iplist=%s', qname, iplist)
-                                return iplist
+                while time.time() < timeout_at:
+                    ins, _, _ = select.select(socks, [], [], 0.1)
+                    for sock in ins:
+                        reply_data, _ = sock.recvfrom(512)
+                        reply = dnslib.DNSRecord.parse(reply_data)
+                        iplist = [str(x.rdata) for x in reply.rr if x.rtype == 1]
+                        if any(x in blacklist for x in iplist):
+                            logging.warning('query qname=%r reply bad iplist=%r', qname, iplist)
+                        else:
+                            logging.debug('query qname=%r reply iplist=%s', qname, iplist)
+                            return iplist
             except socket.error as e:
                 logging.warning('handle dns query=%s socket: %r', query, e)
-            except gevent.timeout.Timeout as e:
-                logging.warning('handle dns query=%s timeout: %r', query, e)
     finally:
         for sock in socks:
             sock.close()
@@ -1417,9 +1415,11 @@ class Common(object):
         self.LOVE_TIP = self.CONFIG.get('love', 'tip').encode('utf8').decode('unicode-escape').split('|')
 
     def resolve_iplist(self):
-        def do_remote_resolve(host, dnsservers, queue):
+        def do_resolve(host, dnsservers, queue):
             try:
-                queue.put((host, dnsservers, dns_remote_resolve(host, dnsservers, self.DNS_BLACKLIST, timeout=2)))
+                iplist = dns_remote_resolve(host, dnsservers, self.DNS_BLACKLIST, timeout=2)
+                if iplist:
+                    queue.put((host, dnsservers, iplist))
             except (socket.error, OSError) as e:
                 logging.error('resolve remote host=%r failed: %s', host, e)
         # https://support.google.com/websearch/answer/186669?hl=zh-Hans
@@ -1433,14 +1433,15 @@ class Common(object):
             for host in need_resolve_remote:
                 for dnsserver in self.DNS_SERVERS:
                     logging.debug('resolve remote host=%r from dnsserver=%r', host, dnsserver)
-                    threading._start_new_thread(do_remote_resolve, (host, [dnsserver], result_queue))
+                    threading._start_new_thread(do_resolve, (host, [dnsserver], result_queue))
             for _ in xrange(len(self.DNS_SERVERS) * len(need_resolve_remote)):
                 try:
                     host, dnsservers, iplist = result_queue.get(timeout=2)
                     resolved_iplist += iplist or []
                     logging.debug('resolve remote host=%r from dnsservers=%s return iplist=%s', host, dnsservers, iplist)
                 except Queue.Empty:
-                    logging.warn('resolve remote timeout, continue')
+                    logging.warn('resolve remote timeout, try resolve local')
+                    resolved_iplist += socket.gethostbyname_ex(host)[-1]
                     break
             if name.startswith('google_') and name not in ('google_cn', 'google_hk'):
                 iplist_prefix = re.split(r'[\.:]', resolved_iplist[0])[0]
