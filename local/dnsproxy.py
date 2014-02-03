@@ -24,8 +24,6 @@ import heapq
 import socket
 import select
 import struct
-import ctypes
-import ctypes.wintypes
 import dnslib
 try:
     import pygeoip
@@ -34,9 +32,10 @@ except ImportError:
 
 
 def win32dns_query_dnsserver_list():
+    import ctypes, ctypes.wintypes, struct, socket
     DNS_CONFIG_DNS_SERVER_LIST = 6
     buf = ctypes.create_string_buffer(2048)
-    ctypes.windll.dnsapi.DnsQueryConfig(DNS_CONFIG_DNS_SERVER_LIST, 0, None, None, buf, ctypes.wintypes.DWORD(len(buf)))
+    ctypes.windll.dnsapi.DnsQueryConfig(DNS_CONFIG_DNS_SERVER_LIST, 0, None, None, ctypes.byref(buf), ctypes.byref(ctypes.wintypes.DWORD(len(buf))))
     ips = struct.unpack('I', buf[0:4])[0]
     out = []
     for i in xrange(ips):
@@ -123,9 +122,15 @@ class DNSServer(gevent.server.DatagramServer):
         self.dns_timeout = int(dns_timeout)
         self.dns_cache = ExpireCache(max_size=65536)
         self.dns_trust_servers = set(['8.8.8.8', '8.8.4.4'])
-        if pygeoip and os.path.isfile('GeoIP.dat'):
-            geoip = pygeoip.GeoIP('GeoIP.dat')
-            self.dns_trust_servers = set(list(self.dns_trust_servers) + [x for x in self.dns_servers if geoip.country_name_by_addr(x) not in ('China',)])
+        if pygeoip:
+            for dirname in ('.', '/usr/share/GeoIP/', '/usr/local/share/GeoIP/'):
+                filename = os.path.join(dirname, 'GeoIP.dat')
+                if os.path.isfile(filename):
+                    geoip = pygeoip.GeoIP(filename)
+                    for dnsserver in self.dns_servers:
+                        if geoip.country_name_by_addr(dnsserver) not in ('China',):
+                            self.dns_trust_servers.add(dnsserver)
+                    break
 
     def handle(self, data, address):
         logging.debug('receive from %r data=%r', address, data)
@@ -138,16 +143,16 @@ class DNSServer(gevent.server.DatagramServer):
             reply_data = ''
         sock_v4 = sock_v6 = None
         socks = []
-        is_plain_hostname = '.' not in qname
+        is_local_hostname = '.' not in qname
         if 'USERDNSDOMAIN' in os.environ:
-            is_plain_hostname = '.' not in qname.rstrip('.' + os.environ['USERDNSDOMAIN'].lower())
-        if is_plain_hostname and not self.dns_intranet_servers:
+            is_local_hostname = qname.lower().endswith('.' + os.environ['USERDNSDOMAIN'].lower())
+        if is_local_hostname and not self.dns_intranet_servers:
             logging.warning('qname=%r is a plain hostname, need intranet dns server!!!', qname)
             reply = dnslib.DNSRecord(header=dnslib.DNSHeader(id=request.header.id, rcode=3))
             self.sendto(reply.pack(), address)
             return
-        dns_v4_servers = self.dns_v4_servers if not is_plain_hostname else [x for x in self.dns_intranet_servers if ':' not in x]
-        dns_v6_servers = self.dns_v6_servers if not is_plain_hostname else [x for x in self.dns_intranet_servers if ':' in x]
+        dns_v4_servers = self.dns_v4_servers if not is_local_hostname else [x for x in self.dns_intranet_servers if ':' not in x]
+        dns_v6_servers = self.dns_v6_servers if not is_local_hostname else [x for x in self.dns_intranet_servers if ':' in x]
         if dns_v4_servers:
             sock_v4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             socks.append(sock_v4)
@@ -178,7 +183,7 @@ class DNSServer(gevent.server.DatagramServer):
                             logging.warning('query qname=%r reply bad iplist=%r, continue', qname, iplist)
                             reply_data = ''
                             continue
-                        if reply.header.rcode and need_reply_servers and reply_server not in self.dns_trust_servers:
+                        if reply.header.rcode and not iplist and need_reply_servers and reply_server not in self.dns_trust_servers:
                             try:
                                 need_reply_servers.remove(reply_server)
                             except KeyError:
@@ -191,7 +196,8 @@ class DNSServer(gevent.server.DatagramServer):
                                 logging.info('query qname=%r qtype=%r reply nonzero rcode=%r', qname, qtype, reply.header.rcode)
                         ttl = max(x.ttl for x in reply.rr) if reply.rr else 600
                         logging.debug('query qname=%r qtype=%r reply_server=%r reply iplist=%s, ttl=%r', qname, qtype, reply_server, iplist, ttl)
-                        self.dns_cache.set((qname, qtype), reply_data, ttl*2)
+                        if iplist or qname.endswith('.in-addr.arpa'):
+                            self.dns_cache.set((qname, qtype), reply_data, ttl*2)
                         break
             except socket.error as e:
                 logging.warning('handle dns data=%r socket: %r', data, e)

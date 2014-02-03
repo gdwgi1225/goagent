@@ -1559,6 +1559,37 @@ class RC4FileObject(object):
     def read(self, size=-1):
         return self.__cipher.encrypt(self.__stream.read(size))
 
+def read_random_bits(nbits):
+    '''Reads 'nbits' random bits.
+
+    If nbits isn't a whole number of bytes, an extra byte will be appended with
+    only the lower bits set.
+    '''
+
+    nbytes, rbits = divmod(nbits, 8)
+
+    # Get the random bytes
+    randomdata = os.urandom(nbytes)
+
+    # Add the remaining random bits
+    if rbits > 0:
+        randomvalue = ord(os.urandom(1))
+        randomvalue >>= (8 - rbits)
+        randomdata = byte(randomvalue) + randomdata
+    return randomdata
+    
+def generate_RSA(bits=2048):
+    '''
+    Generate an RSA keypair with an exponent of 65537 in PEM format
+    param: bits The key length in bits
+    Return private key and public key
+    '''
+    from Crypto.PublicKey import RSA
+    new_key = RSA.generate(bits, e=65537)
+    public_key = new_key.publickey().exportKey("PEM")
+    private_key = new_key.exportKey("PEM")
+    print private_key
+    print public_key
 
 class XORCipher(object):
     """XOR Cipher Class"""
