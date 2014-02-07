@@ -2469,6 +2469,37 @@ class PHPProxyHandler(GAEProxyHandler):
                 raise
 
 
+def get_uptime():
+    if os.name == 'nt':
+        import ctypes
+        tick = ctypes.windll.kernel32.GetTickCount64()
+        return tick / 1000.0
+    elif os.path.isfile('/proc/uptime'):
+        with open('/proc/uptime', 'rb') as fp:
+            uptime = fp.readline().strip().split()[0].strip()
+            return float(uptime)
+    elif any(os.path.isfile(os.path.join(x, 'uptime')) for x in os.environ['PATH'].split(os.pathsep)):
+        # http://www.opensource.apple.com/source/lldb/lldb-69/test/pexpect-2.4/examples/uptime.py
+        pattern = r'up\s+(.*?),\s+([0-9]+) users?,\s+load averages?: ([0-9]+\.[0-9][0-9]),?\s+([0-9]+\.[0-9][0-9]),?\s+([0-9]+\.[0-9][0-9])'
+        output = os.popen('uptime').read()
+        duration, _, _, _, _ = re.search(pattern, output).groups()
+        days, hours, mins = 0, 0, 0
+        if 'day' in duration:
+            m = re.search(r'([0-9]+)\s+day', duration)
+            days = int(m.group(1))
+        if ':' in duration:
+            m = re.search(r'([0-9]+):([0-9]+)', duration)
+            hours = int(m.group(1))
+            mins = int(m.group(2))
+        if 'min' in duration:
+            m = re.search(r'([0-9]+)\s+min', duration)
+            mins = int(m.group(1))
+        return days * 86400 + hours * 3600 + mins * 60
+    else:
+        #TODO: support other platforms
+        return None
+
+
 class PACProxyHandler(GAEProxyHandler):
 
     localhosts = ('127.0.0.1', 'localhost')
@@ -2560,7 +2591,10 @@ class PACProxyHandler(GAEProxyHandler):
             if self.path.endswith('.pac?flush'):
                 thread.start_new_thread(PacUtil.update_pacfile, (self.pacfile,))
             elif time.time() - os.path.getmtime(self.pacfile) > common.PAC_EXPIRED:
-                thread.start_new_thread(lambda: os.utime(self.pacfile, (time.time(), time.time())) or PacUtil.update_pacfile(self.pacfile), tuple())
+                # check system uptime > 30 minutes
+                uptime = get_uptime()
+                if uptime and uptime > 1800:
+                    thread.start_new_thread(lambda: os.utime(self.pacfile, (time.time(), time.time())) or PacUtil.update_pacfile(self.pacfile), tuple())
             with open(filename, 'rb') as fp:
                 data = fp.read()
                 self.wfile.write(('HTTP/1.1 200\r\nContent-Type: %s\r\nContent-Length: %s\r\n\r\n' % (mimetype, len(data))).encode())
