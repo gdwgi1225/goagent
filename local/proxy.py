@@ -2472,8 +2472,8 @@ class PHPProxyHandler(GAEProxyHandler):
 def get_uptime():
     if os.name == 'nt':
         import ctypes
-        tick = ctypes.windll.kernel32.GetTickCount64()
-        return tick / 1000.0
+        GetTickCount64 = ctypes.windll.kernel32.GetTickCount64()
+        return GetTickCount64 / 1000.0
     elif os.path.isfile('/proc/uptime'):
         with open('/proc/uptime', 'rb') as fp:
             uptime = fp.readline().strip().split()[0].strip()
