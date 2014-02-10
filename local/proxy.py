@@ -2135,7 +2135,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 if response.app_status == 503:
                     if len(common.GAE_APPIDS) > 1:
                         common.GAE_APPIDS.pop(0)
-                        logging.info('Current APPID Over Quota,Auto Switch to [%s], Retrying…' % (common.GAE_APPIDS[0]))
+                        logging.info('Current APPID Over Quota,Auto Switch to [%s], Retrying...' % (common.GAE_APPIDS[0]))
                         self.do_METHOD_AGENT()
                         return
                     else:
