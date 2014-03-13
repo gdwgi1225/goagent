@@ -311,7 +311,7 @@ class CertUtil(object):
 
     @staticmethod
     def get_cert(commonname, sans=()):
-        if commonname.count('.') >= 2 and len(commonname.split('.')[-2]) > 4:
+        if commonname.count('.') >= 2 and [len(x) for x in reversed(commonname.split('.'))] > [2, 4]:
             commonname = '.'+commonname.partition('.')[-1]
         certfile = os.path.join(CertUtil.ca_certdir, commonname + '.crt')
         if os.path.exists(certfile):
@@ -673,12 +673,12 @@ class PacUtil(object):
                 if '/' not in line:
                     use_domain = True
                 else:
-                    if not line.startswith('http://'):
+                    if not line.startswith(('http://', 'https://')):
                         line = 'http://' + line
                     use_start = True
             elif '|' == line[0]:
                 line = line[1:]
-                if not line.startswith('http://'):
+                if not line.startswith(('http://', 'https://')):
                     line = 'http://' + line
                 use_start = True
             if line[-1] in ('^', '|'):
