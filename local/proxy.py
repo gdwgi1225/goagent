@@ -772,7 +772,8 @@ def dns_remote_resolve(qname, dnsservers, blacklist, timeout):
                     for sock in ins:
                         reply_data, _ = sock.recvfrom(512)
                         reply = dnslib.DNSRecord.parse(reply_data)
-                        iplist = [str(x.rdata) for x in reply.rr if x.rtype == 1]
+                        rtypes = (1, 28) if sock is sock_v6 else (1,)
+                        iplist = [str(x.rdata) for x in reply.rr if x.rtype in rtypes]
                         if any(x in blacklist for x in iplist):
                             logging.warning('query qname=%r reply bad iplist=%r', qname, iplist)
                         else:
@@ -1368,6 +1369,7 @@ class Common(object):
         self.HTTP_CRLFSITES = tuple(self.CONFIG.get(http_section, 'crlfsites').split('|'))
         self.HTTP_FORCEHTTPS = set(self.CONFIG.get(http_section, 'forcehttps').split('|'))
         self.HTTP_FAKEHTTPS = set(self.CONFIG.get(http_section, 'fakehttps').split('|'))
+        self.HTTP_DNS = self.CONFIG.get(http_section, 'dns').split('|') if self.CONFIG.has_option(http_section, 'dns') else []
 
         self.IPLIST_MAP = collections.OrderedDict((k, v.split('|')) for k, v in self.CONFIG.items('iplist'))
         self.IPLIST_MAP.update((k, [k]) for k, v in self.HOSTS_MAP.items() if k == v)
@@ -1425,8 +1427,7 @@ class Common(object):
 
         self.DNS_ENABLE = self.CONFIG.getint('dns', 'enable')
         self.DNS_LISTEN = self.CONFIG.get('dns', 'listen')
-        # self.DNS_DNSSERVER = self.CONFIG.get('dns', 'dns').split('|')
-        self.DNS_SERVERS = self.CONFIG.get('dns', 'servers').split('|')
+        self.DNS_SERVERS = self.HTTP_DNS or self.CONFIG.get('dns', 'servers').split('|')
         self.DNS_BLACKLIST = set(self.CONFIG.get('dns', 'blacklist').split('|'))
 
         self.USERAGENT_ENABLE = self.CONFIG.getint('useragent', 'enable')
@@ -1611,6 +1612,7 @@ def generate_RSA(bits=2048):
     private_key = new_key.exportKey("PEM")
     print private_key
     print public_key
+
 
 class XORCipher(object):
     """XOR Cipher Class"""
@@ -2370,10 +2372,11 @@ def php_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
     metadata = 'G-Method:%s\nG-Url:%s\n%s%s' % (method, url, ''.join('G-%s:%s\n' % (k, v) for k, v in kwargs.items() if v), ''.join('%s:%s\n' % (k, v) for k, v in headers.items() if k not in skip_headers))
     metadata = zlib.compress(metadata)[2:-4]
     app_payload = b''.join((struct.pack('!h', len(metadata)), metadata, payload))
+    app_headers = {'Content-Length': len(app_payload), 'Content-Type': 'application/octet-stream'}
     fetchserver += '?%s' % random.random()
     crlf = 0 if fetchserver.startswith('https') else common.PHP_CRLF
     connection_cache_key = '%s//:%s' % urlparse.urlparse(fetchserver)[:2]
-    response = http_util.request('POST', fetchserver, app_payload, {'Content-Length': len(app_payload)}, crlf=crlf, connection_cache_key=connection_cache_key)
+    response = http_util.request('POST', fetchserver, app_payload, app_headers, crlf=crlf, connection_cache_key=connection_cache_key)
     if not response:
         raise socket.error(errno.ECONNRESET, 'urlfetch %r return None' % url)
     response.app_status = response.status
@@ -2732,6 +2735,12 @@ def pre_start():
                 error = u'某些安全软件(如 %s)可能和本软件存在冲突，造成 CPU 占用过高。\n如有此现象建议暂时退出此安全软件来继续运行GoAgent' % ','.join(softwares)
                 ctypes.windll.user32.MessageBoxW(None, error, title, 0)
                 #sys.exit(0)
+    if os.path.isfile('/proc/cpuinfo'):
+        with open('/proc/cpuinfo', 'rb') as fp:
+            m = re.search(r'(?im)(BogoMIPS|cpu MHz)\s+:\s+([\d\.]+)', fp.read())
+            if m and float(m.group(2)) < 1000:
+                logging.critical("please set [gae]window=2")
+                sys.exit(0)
     if common.GAE_APPIDS[0] == 'goagent':
         logging.critical('please edit %s to add your appid to [gae] !', common.CONFIG_FILENAME)
         sys.exit(-1)
