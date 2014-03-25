@@ -36,7 +36,7 @@
 #      s2marine0         <s2marine0@gmail.com>
 #      Toshio Xiang      <snachx@gmail.com>
 
-__version__ = '3.1.5'
+__version__ = '3.1.6'
 
 import sys
 import os
@@ -570,11 +570,11 @@ class PacUtil(object):
         try:
             logging.info('try download %r to update_pacfile(%r)', common.PAC_GFWLIST, filename)
             autoproxy_content = base64.b64decode(opener.open(common.PAC_GFWLIST).read())
-            logging.info('%r downloaded, try convert it with autoproxy2pac', common.PAC_GFWLIST)
+            logging.info('%r downloaded, try convert it with autoproxy2pac_lite', common.PAC_GFWLIST)
             if 'gevent' in sys.modules and time.sleep is getattr(sys.modules['gevent'], 'sleep', None) and hasattr(gevent.get_hub(), 'threadpool'):
-                jsrule = gevent.get_hub().threadpool.apply_e(Exception, PacUtil.autoproxy2pac, (autoproxy_content, 'FindProxyForURLByAutoProxy', autoproxy, default))
+                jsrule = gevent.get_hub().threadpool.apply_e(Exception, PacUtil.autoproxy2pac_lite, (autoproxy_content, 'FindProxyForURLByAutoProxy', autoproxy, default))
             else:
-                jsrule = PacUtil.autoproxy2pac(autoproxy_content, 'FindProxyForURLByAutoProxy', autoproxy, default)
+                jsrule = PacUtil.autoproxy2pac_lite(autoproxy_content, 'FindProxyForURLByAutoProxy', autoproxy, default)
             content += '\r\n' + jsrule + '\r\n'
             logging.info('%r downloaded and parsed', common.PAC_GFWLIST)
         except Exception as e:
@@ -620,6 +620,62 @@ class PacUtil(object):
         return function
 
     @staticmethod
+    def autoproxy2pac_lite(content, func_name='FindProxyForURLByAutoProxy', proxy='127.0.0.1:1998', default='DIRECT', indent=4):
+        """Autoproxy to Pac, based on https://github.com/iamamac/autoproxy2pac"""
+        direct_domain_set = set([])
+        proxy_domain_set = set([])
+        for line in content.splitlines()[1:]:
+            if line and not line.startswith(('!', '|!', '||!')):
+                use_proxy = True
+                if line.startswith("@@"):
+                    line = line[2:]
+                    use_proxy = False
+                domain = ''
+                if line.startswith('/') and line.endswith('/'):
+                    line = line[1:-1]
+                    if line.startswith('^https?:\\/\\/[^\\/]+') and re.match(r'^(\w|\\\-|\\\.)+$', line[18:]):
+                        domain = line[18:].replace(r'\.', '.')
+                    else:
+                        logging.warning('unsupport gfwlist regex: %r', line)
+                elif line.startswith('||'):
+                    domain = line[2:].lstrip('*').rstrip('/')
+                elif line.startswith('|'):
+                    domain = urlparse.urlparse(line[1:]).netloc.lstrip('*')
+                elif line.startswith(('http://', 'https://')):
+                    domain = urlparse.urlparse(line).netloc.lstrip('*')
+                elif re.search(r'^([\w\-\_\.]+)([\*\/]|$)', line):
+                    domain = re.split(r'[\*\/]', line)[0]
+                else:
+                    pass
+                if '*' in domain:
+                    domain = domain.split('*')[-1]
+                if not domain or re.match(r'^\w+$', domain):
+                    logging.debug('unsupport gfwlist rule: %r', line)
+                    continue
+                if use_proxy:
+                    proxy_domain_set.add(domain)
+                else:
+                    direct_domain_set.add(domain)
+        jsLines = ',\n'.join('%s"%s": 1' % (' '*indent, x.lstrip('.')) for x in proxy_domain_set)
+        template = '''\
+                    var domainsFor%s = {
+                    %s
+                    };
+                    function %s(url, host) {
+                        var lastPos;
+                        do {
+                            if (domainsFor%s.hasOwnProperty(host)) {
+                                return 'PROXY %s';
+                            }
+                            lastPos = host.indexOf('.') + 1;
+                            host = host.slice(lastPos);
+                        } while (lastPos >= 1);
+                        return '%s';
+                    }'''
+        template = re.sub(r'(?m)^\s{%d}' % min(len(re.search(r' +', x).group()) for x in template.splitlines()), '', template)
+        return template % (func_name, jsLines, func_name, func_name, proxy, default)
+
+    @staticmethod
     def urlfilter2pac(content, func_name='FindProxyForURLByUrlfilter', proxy='127.0.0.1:1999', default='DIRECT', indent=4):
         """urlfilter.ini to Pac, based on https://github.com/iamamac/autoproxy2pac"""
         jsLines = []
@@ -645,7 +701,8 @@ class PacUtil(object):
     @staticmethod
     def adblock2pac(content, func_name='FindProxyForURLByAdblock', proxy='127.0.0.1:1999', default='DIRECT', indent=4):
         """adblock list to Pac, based on https://github.com/iamamac/autoproxy2pac"""
-        jsLines = []
+        white_conditions = []
+        black_conditions = []
         for line in content.splitlines()[1:]:
             if not line or line.startswith('!') or '##' in line or '#@#' in line:
                 continue
@@ -685,60 +742,65 @@ class PacUtil(object):
                 line = line[:-1]
                 if not use_postfix:
                     use_end = True
-            return_proxy = 'PROXY %s' % proxy if use_proxy else default
             line = line.replace('^', '*').strip('*')
             if use_start and use_end:
                 if '*' in line:
-                    jsLine = 'if (shExpMatch(url, "%s")) return "%s";' % (line, return_proxy)
+                    jsCondition = ['shExpMatch(url, "%s")' % line]
                 else:
-                    jsLine = 'if (url == "%s") return "%s";' % (line, return_proxy)
+                    jsCondition = ['url == "%s"' % line]
             elif use_start:
                 if '*' in line:
                     if use_postfix:
-                        jsCondition = ' || '.join('shExpMatch(url, "%s*%s")' % (line, x) for x in use_postfix)
-                        jsLine = 'if (%s) return "%s";' % (jsCondition, return_proxy)
+                        jsCondition = ['shExpMatch(url, "%s*%s")' % (line, x) for x in use_postfix]
                     else:
-                        jsLine = 'if (shExpMatch(url, "%s*")) return "%s";' % (line, return_proxy)
+                        jsCondition = ['shExpMatch(url, "%s*")' % line]
                 else:
-                    jsLine = 'if (url.indexOf("%s") == 0) return "%s";' % (line, return_proxy)
+                    jsCondition = ['url.indexOf("%s") == 0' % line]
             elif use_domain and use_end:
                 if '*' in line:
-                    jsLine = 'if (shExpMatch(host, "%s*")) return "%s";' % (line, return_proxy)
+                    jsCondition = ['shExpMatch(host, "%s*")' % line]
                 else:
-                    jsLine = 'if (host == "%s") return "%s";' % (line, return_proxy)
+                    jsCondition = ['host == "%s"' % line]
             elif use_domain:
                 if line.split('/')[0].count('.') <= 1:
                     if use_postfix:
-                        jsCondition = ' || '.join('shExpMatch(url, "http://*.%s*%s")' % (line, x) for x in use_postfix)
-                        jsLine = 'if (%s) return "%s";' % (jsCondition, return_proxy)
+                        jsCondition = ['shExpMatch(url, "http://*.%s*%s")' % (line, x) for x in use_postfix]
                     else:
-                        jsLine = 'if (shExpMatch(url, "http://*.%s*")) return "%s";' % (line, return_proxy)
+                        jsCondition = ['shExpMatch(url, "http://*.%s*")' % line]
                 else:
                     if '*' in line:
                         if use_postfix:
-                            jsCondition = ' || '.join('shExpMatch(url, "http://%s*%s")' % (line, x) for x in use_postfix)
-                            jsLine = 'if (%s) return "%s";' % (jsCondition, return_proxy)
+                            jsCondition = ['shExpMatch(url, "http://%s*%s")' % (line, x) for x in use_postfix]
                         else:
-                            jsLine = 'if (shExpMatch(url, "http://%s*")) return "%s";' % (line, return_proxy)
+                            jsCondition = ['shExpMatch(url, "http://%s*")' % line]
                     else:
                         if use_postfix:
-                            jsCondition = ' || '.join('shExpMatch(url, "http://%s*%s")' % (line, x) for x in use_postfix)
-                            jsLine = 'if (%s) return "%s";' % (jsCondition, return_proxy)
+                            jsCondition = ['shExpMatch(url, "http://%s*%s")' % (line, x) for x in use_postfix]
                         else:
-                            jsLine = 'if (url.indexOf("http://%s") == 0) return "%s";' % (line, return_proxy)
+                            jsCondition = ['url.indexOf("http://%s") == 0' % line]
             else:
                 if use_postfix:
-                    jsCondition = ' || '.join('shExpMatch(url, "*%s*%s")' % (line, x) for x in use_postfix)
-                    jsLine = 'if (%s) return "%s";' % (jsCondition, return_proxy)
+                    jsCondition = ['shExpMatch(url, "*%s*%s")' % (line, x) for x in use_postfix]
                 else:
-                    jsLine = 'if (shExpMatch(url, "*%s*")) return "%s";' % (line, return_proxy)
-            jsLine = ' ' * indent + jsLine.replace('**', '*')
+                    jsCondition = ['shExpMatch(url, "*%s*")' % line]
             if use_proxy:
-                jsLines.append(jsLine)
+                black_conditions += jsCondition
             else:
-                jsLines.insert(0, jsLine)
-        function = 'function %s(url, host) {\r\n%s\r\n%sreturn "%s";\r\n}' % (func_name, '\n'.join(jsLines), ' '*indent, default)
-        return function
+                white_conditions += jsCondition
+        black_lines = ' ||\r\n'.join('%s%s' % (' '*(4+indent), x.replace('**', '*')) for x in black_conditions).strip()
+        white_lines = ' ||\r\n'.join('%s%s' % (' '*(4+indent), x.replace('**', '*')) for x in white_conditions).strip()
+        template = '''\
+                    function %s(url, host) {
+                        if (%s) {
+                            return "%s";
+                        }
+                        if (%s) {
+                            return "PROXY %s";
+                        }
+                        return "%s";
+                    }'''
+        template = re.sub(r'(?m)^\s{%d}' % min(len(re.search(r' +', x).group()) for x in template.splitlines()), '', template)
+        return template % (func_name, white_lines, default, black_lines, proxy, default)
 
 
 def dns_remote_resolve(qname, dnsservers, blacklist, timeout):
@@ -1229,12 +1291,18 @@ class HTTPUtil(object):
 
     def _request(self, sock, method, path, protocol_version, headers, payload, bufsize=8192, crlf=None, return_sock=None):
         skip_headers = self.skip_headers
-        need_crlf = bool(crlf)
-        if need_crlf:
-            fakehost = 'www.' + ''.join(random.choice(('bcdfghjklmnpqrstvwxyz','aeiou')[x&1]) for x in xrange(random.randint(5,20))) + random.choice(['.net', '.com', '.org'])
-            request_data = 'GET / HTTP/1.1\r\nHost: %s\r\n\r\n\r\n\r\r' % fakehost
-        else:
-            request_data = ''
+        request_data = ''
+        crlf_counter = 0
+        if crlf:
+            fakeheaders = dict((k.title(), v) for k, v in headers.items())
+            fakeheaders['Host'] = 'www.google.cn'
+            fakeheaders['Cookie'] = ''.join(random.choice(string.letters) for _ in xrange(random.randint(800, 1000)))
+            fakeheaders.pop('Content-Length', None)
+            fakeheaders_data = ''.join('%s: %s\r\n' % (k, v) for k, v in fakeheaders.items() if k not in skip_headers)
+            while crlf_counter < 2 or len(request_data) < 1500:
+                request_data += 'GET / HTTP/1.1\r\n%s\r\n' % fakeheaders_data
+                crlf_counter += 1
+            request_data += '\r\n\r\n\r\n'
         request_data += '%s %s %s\r\n' % (method, path, protocol_version)
         request_data += ''.join('%s: %s\r\n' % (k.title(), v) for k, v in headers.items() if k.title() not in skip_headers)
         if self.proxy:
@@ -1255,14 +1323,16 @@ class HTTPUtil(object):
         else:
             raise TypeError('http_util.request(payload) must be a string or buffer, not %r' % type(payload))
 
-        if need_crlf:
-            try:
-                response = httplib.HTTPResponse(sock)
+        try:
+            while crlf_counter:
+                response = httplib.HTTPResponse(sock, buffering=False)
                 response.begin()
                 response.read()
-            except Exception:
-                logging.exception('crlf skip read')
-                return None
+                response.close()
+                crlf_counter -= 1
+        except Exception as e:
+            logging.exception('crlf skip read host=%r path=%r error: %r', headers.get('Host'), path, e)
+            return None
 
         if return_sock:
             return sock
@@ -1370,6 +1440,12 @@ class Common(object):
         self.HTTP_FORCEHTTPS = set(self.CONFIG.get(http_section, 'forcehttps').split('|'))
         self.HTTP_FAKEHTTPS = set(self.CONFIG.get(http_section, 'fakehttps').split('|'))
         self.HTTP_DNS = self.CONFIG.get(http_section, 'dns').split('|') if self.CONFIG.has_option(http_section, 'dns') else []
+        # for hostname in [k for k, _ in self.CONFIG.items(hosts_section) if k.startswith(('https://', 'https?://'))]:
+        #     m = re.search(r'(?<=//)(\-|\_|\w|\\.)+(?=/)', hostname)
+        #     if m:
+        #         host = m.group().replace('\\.', '.')
+        #         self.HTTP_FAKEHTTPS.add(host)
+        #         logging.info('add host=%r to fakehttps', host)
 
         self.IPLIST_MAP = collections.OrderedDict((k, v.split('|')) for k, v in self.CONFIG.items('iplist'))
         self.IPLIST_MAP.update((k, [k]) for k, v in self.HOSTS_MAP.items() if k == v)
@@ -2060,7 +2136,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 finally:
                     logging.info('%r matched local file %r, return', self.path, filename)
                     return
-            need_crlf = hostname.startswith('google_') or host.endswith(common.HTTP_CRLFSITES)
+            need_crlf = host.endswith(common.HTTP_CRLFSITES)
             hostname = hostname or host
             if hostname in common.IPLIST_MAP:
                 http_util.dns[host] = common.IPLIST_MAP[hostname]
