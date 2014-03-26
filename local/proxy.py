@@ -2152,7 +2152,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             if not response:
                 return
             logging.info('%s "FWD %s %s HTTP/1.1" %s %s', self.address_string(), self.command, self.path, response.status, response.getheader('Content-Length', '-'))
-            self.wfile.write(('HTTP/1.1 %s\r\n%s %s\r\n%s\r\n' % (response.status, httplib.responses.get(response.status, 'Unkown'), ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
+            self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n%s\r\n' % (response.status, httplib.responses.get(response.status, 'Unkown'), ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
             while True:
                 data = response.read(8192)
                 if not data:
@@ -2248,7 +2248,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     continue
                 if response.app_status != 200 and retry == common.FETCHMAX_LOCAL-1:
                     logging.info('%s "GAE %s %s HTTP/1.1" %s -', self.address_string(), self.command, self.path, response.status)
-                    self.wfile.write(('HTTP/1.1 %s\r\n%sself.wfile.write(('HTTP/1.1 %s %s\r\n%s\r\n' % (response.status, httplib.responses.get(response.status, 'Unkown'), ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
+                    self.wfile.write(('HTTP/1.1 %s %s\r\n%s\r\n' % (response.status, httplib.responses.get(response.status, 'Unkown'), ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
                     self.wfile.write(response.read())
                     response.close()
                     return
@@ -2263,7 +2263,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         response.msg['Set-Cookie'] = self.normcookie(response.getheader('Set-Cookie'))
                     if response.getheader('Content-Disposition') and '"' not in response.getheader('Content-Disposition'):
                         response.msg['Content-Disposition'] = self.normattachment(response.getheader('Content-Disposition'))
-                    headers_data = 'HTTP/1.1 %s\r\n%s %s\r\n%s\r\n' % (response.status, httplib.responses.get(response.status, 'Unkown'), ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))
+                    headers_data = 'HTTP/1.1 %s\r\n%s\r\n%s\r\n' % (response.status, httplib.responses.get(response.status, 'Unkown'), ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))
                     logging.debug('headers_data=%s', headers_data)
                     #self.wfile.write(headers_data.encode() if bytes is not str else headers_data)
                     self.wfile.write(headers_data)
@@ -2552,7 +2552,7 @@ class PHPProxyHandler(GAEProxyHandler):
 
             logging.info('%s "PHP %s %s HTTP/1.1" %s -', self.address_string(), self.command, self.path, response.status)
             if response.status != 200:
-                self.wfile.write('HTTP/1.1 %s\r\n%s %s\r\n%s\r\n' % (response.status, httplib.responses.get(response.status, 'Unkown'), ''.join('%s: %s\r\n' % (k, v) for k, v in response.getheaders())))
+                self.wfile.write('HTTP/1.1 %s\r\n%s\r\n%s\r\n' % (response.status, httplib.responses.get(response.status, 'Unkown'), ''.join('%s: %s\r\n' % (k, v) for k, v in response.getheaders())))
 
             cipher = response.status == 200 and response.getheader('Content-Type', '') == 'image/gif' and XORCipher(common.PHP_PASSWORD[0])
             while True:
