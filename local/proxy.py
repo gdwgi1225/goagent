@@ -72,7 +72,6 @@ import io
 import fnmatch
 import traceback
 import random
-import subprocess
 import base64
 import string
 import hashlib
@@ -97,9 +96,9 @@ try:
 except ImportError:
     OpenSSL = None
 try:
-    import pacparser
+    import pygeoip
 except ImportError:
-    pacparser = None
+    pygeoip = None
 
 
 HAS_PYPY = hasattr(sys, 'pypy_version_info')
@@ -1297,9 +1296,14 @@ class HTTPUtil(object):
         crlf_counter = 0
         if crlf:
             fakeheaders = dict((k.title(), v) for k, v in headers.items())
-            fakeheaders['Host'] = 'www.google.cn'
-            fakeheaders['Cookie'] = ''.join(random.choice(string.letters) for _ in xrange(random.randint(800, 1000)))
             fakeheaders.pop('Content-Length', None)
+            fakeheaders.pop('Cookie', None)
+            if 'User-Agent' not in fakeheaders:
+                fakeheaders['User-Agent'] = 'Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1878.0 Safari/537.36'
+            if 'Accept-Language' not in fakeheaders:
+                fakeheaders['Accept-Language'] = 'zh-CN,zh;q=0.8,en-US;q=0.6,en;q=0.4'
+            if 'Accept' not in fakeheaders:
+                fakeheaders['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
             fakeheaders_data = ''.join('%s: %s\r\n' % (k, v) for k, v in fakeheaders.items() if k not in skip_headers)
             while crlf_counter < 2 or len(request_data) < 1500:
                 request_data += 'GET / HTTP/1.1\r\n%s\r\n' % fakeheaders_data
@@ -1424,6 +1428,7 @@ class Common(object):
         self.GAE_VALIDATE = self.CONFIG.getint('gae', 'validate')
         self.GAE_OBFUSCATE = self.CONFIG.getint('gae', 'obfuscate')
         self.GAE_OPTIONS = self.CONFIG.get('gae', 'options')
+        self.GAE_REGIONS = frozenset(x.upper() for x in self.CONFIG.get('gae', 'regions').split('|') if x.strip())
 
         hosts_section, http_section = '%s/hosts' % self.GAE_PROFILE, '%s/http' % self.GAE_PROFILE
 
@@ -1446,12 +1451,6 @@ class Common(object):
         self.HTTP_FORCEHTTPS = set(self.CONFIG.get(http_section, 'forcehttps').split('|'))
         self.HTTP_FAKEHTTPS = set(self.CONFIG.get(http_section, 'fakehttps').split('|'))
         self.HTTP_DNS = self.CONFIG.get(http_section, 'dns').split('|') if self.CONFIG.has_option(http_section, 'dns') else []
-        # for hostname in [k for k, _ in self.CONFIG.items(hosts_section) if k.startswith(('https://', 'https?://'))]:
-        #     m = re.search(r'(?<=//)(\-|\_|\w|\\.)+(?=/)', hostname)
-        #     if m:
-        #         host = m.group().replace('\\.', '.')
-        #         self.HTTP_FAKEHTTPS.add(host)
-        #         logging.info('add host=%r to fakehttps', host)
 
         self.IPLIST_MAP = collections.OrderedDict((k, v.split('|')) for k, v in self.CONFIG.items('iplist'))
         self.IPLIST_MAP.update((k, [k]) for k, v in self.HOSTS_MAP.items() if k == v)
@@ -1577,7 +1576,6 @@ class Common(object):
         if common.PAC_ENABLE:
             info += 'Pac Server         : http://%s:%d/%s\n' % (self.PAC_IP, self.PAC_PORT, self.PAC_FILE)
             info += 'Pac File           : file://%s\n' % os.path.join(os.path.dirname(os.path.abspath(__file__)), self.PAC_FILE).replace('\\', '/')
-            info += 'Pac Parser Version : %s\n' % pacparser.version() if pacparser else ''
         if common.PHP_ENABLE:
             info += 'PHP Listen         : %s\n' % common.PHP_LISTEN
             info += 'PHP FetchServer    : %s\n' % common.PHP_FETCHSERVER
@@ -1955,6 +1953,7 @@ class RangeFetch(object):
 class LocalProxyServer(SocketServer.ThreadingTCPServer):
     """Local Proxy Server"""
     allow_reuse_address = True
+    daemon_threads = True
 
     def close_request(self, request):
         try:
@@ -2027,6 +2026,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     urlfetch = staticmethod(gae_urlfetch)
     normcookie = functools.partial(re.compile(', ([^ =]+(?:=|$))').sub, '\\r\\nSet-Cookie: \\1')
     normattachment = functools.partial(re.compile(r'filename=([^"\']+)').sub, 'filename="\\1"')
+    geoip = pygeoip.GeoIP('GeoIP.dat') if pygeoip and common.GAE_REGIONS else None
 
     def first_run(self):
         """GAEProxyHandler setup, init domain/iplist map"""
@@ -2095,8 +2095,12 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             return self.do_METHOD_FWD()
         if any(x(self.path) for x in common.METHOD_REMATCH_MAP) or host in common.HOSTS_MAP or host.endswith(common.HOSTS_POSTFIX_ENDSWITH):
             return self.do_METHOD_FWD()
-        else:
-            return self.do_METHOD_AGENT()
+        if common.GAE_REGIONS:
+            iplist = http_util.dns_resolve(host)
+            # http://dev.maxmind.com/geoip/legacy/codes/iso3166/
+            if iplist and self.geoip.country_name_by_addr(iplist[0]) in common.GAE_REGIONS:
+                return self.do_METHOD_FWD()
+        return self.do_METHOD_AGENT()
 
     def do_METHOD_FWD(self):
         """Direct http forward"""
@@ -2317,8 +2321,12 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             return self.do_CONNECT_FWD()
         elif host in common.HOSTS_MAP or host.endswith(common.HOSTS_POSTFIX_ENDSWITH):
             return self.do_CONNECT_FWD()
-        else:
-            return self.do_CONNECT_AGENT()
+        if common.GAE_REGIONS:
+            iplist = http_util.dns_resolve(host)
+            # http://dev.maxmind.com/geoip/legacy/codes/iso3166/
+            if iplist and self.geoip.country_code_by_addr(iplist[0]) in common.GAE_REGIONS:
+                return self.do_CONNECT_FWD()
+        return self.do_CONNECT_AGENT()
 
     def do_CONNECT_FWD(self):
         """socket forward for http CONNECT command"""
@@ -2608,87 +2616,62 @@ def get_uptime():
         return None
 
 
-class PACProxyHandler(GAEProxyHandler):
+class PACProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
-    localhosts = ('127.0.0.1', 'localhost')
-    first_run_lock = threading.Lock()
     pacfile = os.path.join(os.path.dirname(os.path.abspath(__file__)), common.PAC_FILE)
     pacfile_mtime = os.path.getmtime(pacfile)
-    pacparser_lrucache = LRUCache(4096)
+    bufsize = 8192
 
-    def first_run(self):
-        try:
-            self.__class__.localhosts = tuple(set(list(self.localhosts) + [ProxyUtil.get_listen_ip(), socket.gethostname()] + socket.gethostbyname_ex(socket.gethostname())[-1]))
-        except socket.error:
-            pass
-        if pacparser:
-            pacparser.init()
-            pacparser.parse_pac_file(self.pacfile)
-            threading._start_new_thread(self.__pacparser_update)
-        return True
-
-    def setup(self):
-        if isinstance(self.__class__.first_run, collections.Callable):
-            try:
-                with self.__class__.first_run_lock:
-                    if isinstance(self.__class__.first_run, collections.Callable):
-                        self.first_run()
-                        self.__class__.first_run = None
-            except Exception as e:
-                logging.exception('GAEProxyHandler.first_run() return %r', e)
-        self.__class__.setup = BaseHTTPServer.BaseHTTPRequestHandler.setup
-        self.__class__.do_GET = self.__class__.do_METHOD
-        self.__class__.do_PUT = self.__class__.do_METHOD
-        self.__class__.do_POST = self.__class__.do_METHOD
-        self.__class__.do_HEAD = self.__class__.do_METHOD
-        self.__class__.do_DELETE = self.__class__.do_METHOD
-        self.__class__.do_OPTIONS = self.__class__.do_METHOD
-        self.setup()
-
-    def __pacparser_update(self):
-        while True:
-            try:
-                time.sleep(300)
-                mtime = os.path.getmtime(self.pacfile)
-                if mtime > self.__class__.pacfile_mtime:
-                    logging.info('%r updated, parse it')
-                    pacparser.parse_pac_file(self.pacfile)
-                    self.__class__.pacfile_mtime = mtime
-                    self.pacparser_lrucache.clear()
-            except Exception as e:
-                logging.exception('pacparser %r update error: %r', self.pacfile, e)
-                time.sleep(600)
-
-    def find_proxy_with_lrucache(self, url):
-        try:
-            return self.pacparser_lrucache[url]
-        except KeyError:
-            self.pacparser_lrucache[url] = pac_proxy = pacparser.find_proxy(url)
-            return pac_proxy
+    def address_string(self):
+        return '%s:%s' % self.client_address[:2]
 
     def do_CONNECT(self):
-        if not pacparser:
-            self.wfile.write(b'HTTP/1.1 403 Forbidden\r\n\r\n')
+        """deploy fake cert to client"""
+        host, _, port = self.path.rpartition(':')
+        port = int(port)
+        certfile = CertUtil.get_cert(host)
+        logging.info('%s "AGENT %s %s:%d HTTP/1.1" - -', self.address_string(), self.command, host, port)
+        self.wfile.write(b'HTTP/1.1 200 OK\r\n\r\n')
+        try:
+            ssl_sock = ssl.wrap_socket(self.connection, keyfile=certfile, certfile=certfile, server_side=True)
+        except Exception as e:
+            if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET):
+                logging.exception('ssl.wrap_socket(self.connection=%r) failed: %s', self.connection, e)
             return
-        pac_proxy = self.find_proxy_with_lrucache('https://%s/' % self.path.rpartition(':')[0])
-        if pac_proxy == 'DIRECT':
-            return self.do_CONNECT_FWD()
-        else:
-            return GAEProxyHandler.do_CONNECT(self)
+        self.connection = ssl_sock
+        self.rfile = self.connection.makefile('rb', self.bufsize)
+        self.wfile = self.connection.makefile('wb', 0)
+        try:
+            self.raw_requestline = self.rfile.readline(65537)
+            if len(self.raw_requestline) > 65536:
+                self.requestline = ''
+                self.request_version = ''
+                self.command = ''
+                self.send_error(414)
+                return
+            if not self.raw_requestline:
+                self.close_connection = 1
+                return
+            if not self.parse_request():
+                return
+        except NetWorkIOError as e:
+            if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET, errno.EPIPE):
+                raise
+        if self.path[0] == '/' and host:
+            self.path = 'https://%s%s' % (self.headers['Host'], self.path)
+        try:
+            self.do_GET()
+        except NetWorkIOError as e:
+            if e.args[0] not in (errno.ECONNABORTED, errno.ETIMEDOUT, errno.EPIPE):
+                raise
 
-    def do_METHOD(self):
+    def do_GET(self):
         if self.path[0] == '/':
-            host = self.headers.getheader('Host')
-            if not pacparser or not host or host.startswith(self.localhosts):
-                return self.do_METHOD_LOCAL()
-            else:
-                self.path = 'http://%s%s' % (host, self.path)
-        if pacparser:
-            return GAEProxyHandler.do_METHOD(self)
+            return self.do_GET_LOCAL()
         else:
-            return self.do_METHOD_BLACKHOLE()
+            return self.do_GET_BLACKHOLE()
 
-    def do_METHOD_LOCAL(self):
+    def do_GET_LOCAL(self):
         filename = os.path.normpath('./' + urlparse.urlparse(self.path).path)
         if os.path.isfile(filename):
             logging.info('%s "%s %s HTTP/1.1" 200 -', self.address_string(), self.command, self.path)
@@ -2711,8 +2694,8 @@ class PACProxyHandler(GAEProxyHandler):
             logging.info('%s "%s %s HTTP/1.1" 404 -', self.address_string(), self.command, self.path)
             self.wfile.write(b'HTTP/1.1 404\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n404 Not Found')
 
-    def do_METHOD_BLACKHOLE(self):
-        content = 'HTTP/1.1 200\r\n'\
+    def do_GET_BLACKHOLE(self):
+        content = 'HTTP/1.1 200 OK\r\n'\
                   'Cache-Control: max-age=86400\r\n'\
                   'Expires:Oct, 01 Aug 2100 00:00:00 GMT\r\n'\
                   'Connection: close\r\n'
@@ -2721,22 +2704,8 @@ class PACProxyHandler(GAEProxyHandler):
                        'GIF89a\x01\x00\x01\x00\x80\xff\x00\xc0\xc0\xc0\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;'
         else:
             content += '\r\n'
+        logging.info('%s "%s %s HTTP/1.1" 200 0', self.address_string(), self.command, self.path)
         self.wfile.write(content)
-
-    def do_METHOD_AGENT(self):
-        pac_proxy = self.find_proxy_with_lrucache(self.path)
-        if pac_proxy == 'DIRECT' and re.sub(r':\d+$', '', self.url_parts.netloc) not in common.HTTP_WITHGAE:
-            return self.do_METHOD_FWD()
-        elif pac_proxy.startswith('PROXY '):
-            host, _, port = pac_proxy.split()[1].rpartition(':')
-            if host in self.localhosts and int(port) == common.PAC_PORT:
-                return self.do_METHOD_BLACKHOLE()
-            elif host in self.localhosts and int(port) == common.LISTEN_PORT:
-                return GAEProxyHandler.do_METHOD_AGENT(self)
-            else:
-                return self.do_METHOD_FWD()
-        else:
-            GAEProxyHandler.do_METHOD_AGENT(self)
 
 
 def get_process_list():
@@ -2827,6 +2796,9 @@ def pre_start():
         sys.exit(-1)
     if common.GAE_MODE == 'http' and common.GAE_PASSWORD == '':
         logging.critical('to enable http mode, you should set %r [gae]password = <your_pass> and [gae]options = rc4', common.CONFIG_FILENAME)
+        sys.exit(-1)
+    if common.GAE_REGIONS and not pygeoip:
+        logging.critical('to enable [gae]regions mode, you should install pygeoip')
         sys.exit(-1)
     if common.PAC_ENABLE:
         pac_ip = ProxyUtil.get_listen_ip() if common.PAC_IP in ('', '::', '0.0.0.0') else common.PAC_IP
