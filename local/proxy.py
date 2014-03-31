@@ -656,7 +656,8 @@ class PacUtil(object):
                     proxy_domain_set.add(domain)
                 else:
                     direct_domain_set.add(domain)
-        jsLines = ',\n'.join('%s"%s": 1' % (' '*indent, x.lstrip('.')) for x in proxy_domain_set)
+        proxy_domain_set = set(x.lstrip('.') for x in proxy_domain_set)
+        jsLines = ',\n'.join('%s"%s": 1' % (' '*indent, x) for x in proxy_domain_set)
         template = '''\
                     var domainsFor%s = {
                     %s
@@ -730,13 +731,9 @@ class PacUtil(object):
                 if '/' not in line:
                     use_domain = True
                 else:
-                    if not line.startswith(('http://', 'https://')):
-                        line = 'http://' + line
                     use_start = True
             elif '|' == line[0]:
                 line = line[1:]
-                if not line.startswith(('http://', 'https://')):
-                    line = 'http://' + line
                 use_start = True
             if line[-1] in ('^', '|'):
                 line = line[:-1]
@@ -745,17 +742,17 @@ class PacUtil(object):
             line = line.replace('^', '*').strip('*')
             if use_start and use_end:
                 if '*' in line:
-                    jsCondition = ['shExpMatch(url, "%s")' % line]
+                    jsCondition = ['shExpMatch(url, "*%s")' % line]
                 else:
                     jsCondition = ['url == "%s"' % line]
             elif use_start:
                 if '*' in line:
                     if use_postfix:
-                        jsCondition = ['shExpMatch(url, "%s*%s")' % (line, x) for x in use_postfix]
+                        jsCondition = ['shExpMatch(url, "*%s*%s")' % (line, x) for x in use_postfix]
                     else:
                         jsCondition = ['shExpMatch(url, "%s*")' % line]
                 else:
-                    jsCondition = ['url.indexOf("%s") == 0' % line]
+                    jsCondition = ['url.indexOf("%s") >= 0' % line]
             elif use_domain and use_end:
                 if '*' in line:
                     jsCondition = ['shExpMatch(host, "%s*")' % line]
@@ -793,9 +790,9 @@ class PacUtil(object):
         template = '''\
                     function %s(url, host) {
                         // untrusted ablock plus list, disable whitelist until chinalist come back.
-                        if (%s) {
-                            return "%s";
-                        }
+                        // if (%s) {
+                        //    return "%s";
+                        // }
                         if (%s) {
                             return "PROXY %s";
                         }
@@ -1299,6 +1296,7 @@ class HTTPUtil(object):
             fakeheaders = dict((k.title(), v) for k, v in headers.items())
             fakeheaders.pop('Content-Length', None)
             fakeheaders.pop('Cookie', None)
+            fakeheaders.pop('Host', None)
             if 'User-Agent' not in fakeheaders:
                 fakeheaders['User-Agent'] = 'Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1878.0 Safari/537.36'
             if 'Accept-Language' not in fakeheaders:
@@ -1306,7 +1304,7 @@ class HTTPUtil(object):
             if 'Accept' not in fakeheaders:
                 fakeheaders['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
             fakeheaders_data = ''.join('%s: %s\r\n' % (k, v) for k, v in fakeheaders.items() if k not in skip_headers)
-            while crlf_counter < 2 or len(request_data) < 1500:
+            while crlf_counter < 5 or len(request_data) < 1500 * 2:
                 request_data += 'GET / HTTP/1.1\r\n%s\r\n' % fakeheaders_data
                 crlf_counter += 1
             request_data += '\r\n\r\n\r\n'
@@ -1352,7 +1350,7 @@ class HTTPUtil(object):
         return response
 
     def request(self, method, url, payload=None, headers={}, realhost='', bufsize=8192, crlf=None, validate=None, return_sock=None, connection_cache_key=None):
-        scheme, netloc, query, _ = urlparse.urlsplit(url)
+        scheme, netloc, path, query, _ = urlparse.urlsplit(url)
         if netloc.rfind(':') <= netloc.rfind(']'):
             # no port number
             host = netloc
@@ -1454,8 +1452,8 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         ssl_sock = ssl.wrap_socket(sock)
         return ssl_sock
 
-    def __create_http_request(self, method, url, body=None, headers={}, realhost='', timeout=16, max_retry=3, bufsize=8192, crlf=None, validate=None, return_sock=None, connection_cache_key=None):
-        scheme, netloc, path, _, query, _ = urlparse.urlparse(url)
+    def __create_http_request(self, method, url, body=None, headers={}, realhost='', timeout=16, max_retry=3, bufsize=8192, crlf=None, validate=None, connection_cache_key=None):
+        scheme, netloc, path, query, _ = urlparse.urlsplit(url)
         if netloc.rfind(':') <= netloc.rfind(']'):
             # no port number
             host = netloc
@@ -1596,7 +1594,7 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             remote = self.__create_connection(hostname, port, timeout)
         if remote and not isinstance(remote, Exception):
             self.wfile.write(b'HTTP/1.1 200 OK\r\n\r\n')
-        logging.info('%s "FORWARD %s %s:%d %s" - -', self.address_string(), self.command, hostname, port, self.protocol_version)  
+        logging.info('%s "FORWARD %s %s:%d %s" - -', self.address_string(), self.command, hostname, port, self.protocol_version)
         try:
             tick = 1
             bufsize = self.bufsize
@@ -1699,7 +1697,7 @@ class Common(object):
         self.GAE_REGIONS = frozenset(x.upper() for x in self.CONFIG.get('gae', 'regions').split('|') if x.strip())
 
         if self.GAE_PROFILE == 'auto':
-                try:
+            try:
                 s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
                 s.settimeout(1)
                 s.connect(('ipv6.google.com', 80))
@@ -2377,7 +2375,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         if common.GAE_REGIONS:
             iplist = http_util.dns_resolve(host)
             # http://dev.maxmind.com/geoip/legacy/codes/iso3166/
-            if iplist and self.geoip.country_name_by_addr(iplist[0]) in common.GAE_REGIONS:
+            if iplist and self.geoip.country_code_by_addr(iplist[0]) in common.GAE_REGIONS:
                 return self.do_METHOD_FWD()
         return self.do_METHOD_AGENT()
 
@@ -2437,7 +2435,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             if not response:
                 return
             logging.info('%s "FWD %s %s HTTP/1.1" %s %s', self.address_string(), self.command, self.path, response.status, response.getheader('Content-Length', '-'))
-            self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n%s\r\n' % (response.status, httplib.responses.get(response.status, 'Unkown'), ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
+            self.wfile.write(('HTTP/1.1 %s %s\r\n%s\r\n' % (response.status, httplib.responses.get(response.status, 'Unkown'), ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
             while True:
                 data = response.read(8192)
                 if not data:
@@ -2548,7 +2546,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         response.msg['Set-Cookie'] = self.normcookie(response.getheader('Set-Cookie'))
                     if response.getheader('Content-Disposition') and '"' not in response.getheader('Content-Disposition'):
                         response.msg['Content-Disposition'] = self.normattachment(response.getheader('Content-Disposition'))
-                    headers_data = 'HTTP/1.1 %s\r\n%s\r\n%s\r\n' % (response.status, httplib.responses.get(response.status, 'Unkown'), ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))
+                    headers_data = 'HTTP/1.1 %s %s\r\n%s\r\n' % (response.status, httplib.responses.get(response.status, 'Unkown'), ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))
                     logging.debug('headers_data=%s', headers_data)
                     #self.wfile.write(headers_data.encode() if bytes is not str else headers_data)
                     self.wfile.write(headers_data)
@@ -2841,7 +2839,7 @@ class PHPProxyHandler(GAEProxyHandler):
 
             logging.info('%s "PHP %s %s HTTP/1.1" %s -', self.address_string(), self.command, self.path, response.status)
             if response.status != 200:
-                self.wfile.write('HTTP/1.1 %s\r\n%s\r\n%s\r\n' % (response.status, httplib.responses.get(response.status, 'Unkown'), ''.join('%s: %s\r\n' % (k, v) for k, v in response.getheaders())))
+                self.wfile.write('HTTP/1.1 %s %s\r\n%s\r\n' % (response.status, httplib.responses.get(response.status, 'Unkown'), ''.join('%s: %s\r\n' % (k, v) for k, v in response.getheaders())))
 
             cipher = response.status == 200 and response.getheader('Content-Type', '') == 'image/gif' and XORCipher(common.PHP_PASSWORD[0])
             while True:
