@@ -1460,7 +1460,7 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         return socket.create_connection((hostname, port), timeout)
 
     def create_ssl_connection(self, hostname, port, timeout, **kwargs):
-        sock = self.create_connection(hostname, port, timeout, **kwargs)
+        sock = self.create_tcp_connection(hostname, port, timeout, **kwargs)
         ssl_sock = ssl.wrap_socket(sock)
         return ssl_sock
 
@@ -1546,7 +1546,7 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         if do_ssl_handshake:
             remote = self.create_ssl_connection(hostname, port, timeout, **kwargs)
         else:
-            remote = self.create_connection(hostname, port, timeout, **kwargs)
+            sock = self.create_tcp_connection(hostname, port, timeout, **kwargs)
         if remote and not isinstance(remote, Exception):
             self.wfile.write(b'HTTP/1.1 200 OK\r\n\r\n')
         logging.info('%s "FORWARD %s %s:%d %s" - -', self.address_string(), self.command, hostname, port, self.protocol_version)
@@ -1582,16 +1582,16 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             if remote:
                 remote.close()
 
-    def do_METHOD_URLFETCH(self, fetchserver,  kwargs={}):
+    def do_METHOD_URLFETCH(self, fetchserver, kwargs={}):
         """urlfetch from fetchserver"""
         method = self.command
         url = self.path
         headers = {k.title(): v for k, v in self.headers.items()}
         body = self.rfile.read(int(headers.get('Content-Length', 0)))
         if fetchserver:
-            response = self.create_http_request_withserver(fetchserver, method, url, headers, body, **kwargs)
+            response = self.create_http_request_withserver(fetchserver, method, url, headers, body, timeout=16, **kwargs)
         else:
-            response = self.create_http_request(method, url, headers, body, **kwargs)
+            response = self.create_http_request(method, url, headers, body, timeout=16, **kwargs)
         logging.info('%s "URLFETCH %s %s HTTP/1.1" %s -', self.address_string(), self.command, self.path, response.status)
         response_headers = {k.title(): v for k, v in response.getheaders()}
         if 'Set-Cookie' in response_headers:
@@ -1614,7 +1614,9 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
     def do_METHOD(self):
         for handler_filter in self.handler_filters:
-            return action.pop(0)(*action)
+            action = handler_filter.filter(self)
+            if action:
+                return action.pop(0)(*action)
 
 
 class ProxyChainMixin:
@@ -1640,7 +1642,7 @@ class ProxyChainMixin:
         return sock
 
     def create_ssl_connection(self, hostname, port, timeout, **kwargs):
-        sock = self.create_connection(hostname, port, timeout, **kwargs)
+        sock = self.create_tcp_connection(hostname, port, timeout, **kwargs)
         ssl_sock = ssl.wrap_socket(sock)
         return ssl_sock
 
@@ -1708,7 +1710,7 @@ class AdvancedProxyHandler(SimpleProxyHandler):
         except Queue.Empty:
             pass
         result = None
-        addresses = [(x, port) for x in self.gethostbyname2(host)]
+        addresses = [(x, port) for x in self.gethostbyname2(hostname)]
         if port == 443:
             get_connection_time = lambda addr: self.ssl_connection_time.__getitem__(addr) or self.tcp_connection_time.__getitem__(addr)
         else:
@@ -1802,7 +1804,7 @@ class AdvancedProxyHandler(SimpleProxyHandler):
                 # set a short timeout to trigger timeout retry more quickly.
                 sock.settimeout(timeout or self.max_timeout)
                 # pick up the certificate
-                server_hostname = b'www.google.com' if address[0].endswith('.appspot.com') else None
+                server_hostname = b'www.google.com' if hostname.endswith('.appspot.com') else None
                 ssl_sock = SSLConnection(self.openssl_context, sock)
                 ssl_sock.set_connect_state()
                 if server_hostname:
@@ -1857,7 +1859,7 @@ class AdvancedProxyHandler(SimpleProxyHandler):
         except Queue.Empty:
             pass
         result = None
-        addresses = [(x, port) for x in self.gethostbyname2(host)]
+        addresses = [(x, port) for x in self.gethostbyname2(hostname)]
         for i in range(3):
             window = min((self.max_window+1)//2 + min(i, 1), len(addresses))
             addresses.sort(key=self.ssl_connection_time.__getitem__)
@@ -1894,12 +1896,12 @@ class AdvancedProxyHandler(SimpleProxyHandler):
         errors = []
         for _ in range(max_retry):
             try:
-                create_connection = create_ssl_connection if scheme == 'https' else self.create_tcp_connection
+                create_connection = self.create_ssl_connection if scheme == 'https' else self.create_tcp_connection
                 sock = create_connection(realhost or host, port, timeout, validate=validate, cache_key=connection_cache_key)
                 if sock and not isinstance(sock, Exception):
                     break
             except Exception as e:
-                logging.exception('_create_http_request "%s %s" failed:%s', method, url, e)
+                logging.exception('create_http_request "%s %s" failed:%s', method, url, e)
                 errors.append(e)
                 continue
         if not sock and errors:
@@ -2283,13 +2285,13 @@ class XORCipher(object):
 def gae_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
     # deflate = lambda x:zlib.compress(x)[2:-4]
     rc4crypt = lambda s, k: RC4Cipher(k).encrypt(s) if k else s
-    if body:
-        if len(body) < 10 * 1024 * 1024 and 'Content-Encoding' not in headers:
-            zbody = zlib.compress(body)[2:-4]
-            if len(zbody) < len(body):
-                body = zbody
-                headers['Content-Encoding'] = 'deflate'
-        headers['Content-Length'] = str(len(body))
+    if payload:
+        if len(payload) < 10 * 1024 * 1024 and 'Content-Encoding' not in headers:
+            zpayload = zlib.compress(payload)[2:-4]
+            if len(zpayload) < len(payload):
+                payload = zpayload
+            headers['Content-Encoding'] = 'deflate'
+        headers['Content-Length'] = str(len(payload))
     # GAE donot allow set `Host` header
     if 'Host' in headers:
         del headers['Host']
@@ -2307,22 +2309,22 @@ def gae_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
         else:
             cookie = base64.b64encode(zlib.compress(metadata)[2:-4]).strip()
         request_headers['Cookie'] = cookie
-        if body:
-            request_headers['Content-Length'] = str(len(body))
+        if payload:
+            request_headers['Content-Length'] = str(len(payload))
         else:
             request_method = 'GET'
     else:
         metadata = zlib.compress(metadata)[2:-4]
-        body = '%s%s%s' % (struct.pack('!h', len(metadata)), metadata, body)
+        payload = '%s%s%s' % (struct.pack('!h', len(metadata)), metadata, payload)
         if 'rc4' in common.GAE_OPTIONS:
             request_headers['X-GOA-Options'] = 'rc4'
-            body = rc4crypt(payload, kwargs.get('password'))
+            payload = rc4crypt(payload, kwargs.get('password'))
         request_headers['Content-Length'] = str(len(body))
     # post data
     need_crlf = 0 if common.GAE_MODE == 'https' else 1
     need_validate = common.GAE_VALIDATE
     connection_cache_key = '%s:%d' % (common.HOSTS_POSTFIX_MAP['.appspot.com'], 443 if common.GAE_MODE == 'https' else 80)
-    response = http_util.request(request_method, fetchserver, request_headers, body, self.max_timeout, crlf=need_crlf, validate=need_validate, connection_cache_key=connection_cache_key)
+    response = http_util.request(request_method, fetchserver, payload, request_headers, crlf=need_crlf, validate=need_validate, connection_cache_key=connection_cache_key)
     response.app_status = response.status
     response.app_options = response.getheader('X-GOA-Options', '')
     if response.status != 200:
@@ -3087,13 +3089,13 @@ class GAEProxyHandler2(AdvancedProxyHandler):
     def _create_http_request_withserver(self, fetchserver, method, url, headers, body, timeout, **kwargs):
         # deflate = lambda x:zlib.compress(x)[2:-4]
         rc4crypt = lambda s, k: RC4Cipher(k).encrypt(s) if k else s
-        if payload:
-            if len(payload) < 10 * 1024 * 1024 and 'Content-Encoding' not in headers:
-                zpayload = zlib.compress(payload)[2:-4]
-                if len(zpayload) < len(payload):
-                    payload = zpayload
+        if body:
+            if len(body) < 10 * 1024 * 1024 and 'Content-Encoding' not in headers:
+                zbody = zlib.compress(body)[2:-4]
+                if len(zbody) < len(body):
+                    body = zbody
                     headers['Content-Encoding'] = 'deflate'
-            headers['Content-Length'] = str(len(payload))
+            headers['Content-Length'] = str(len(body))
         # GAE donot allow set `Host` header
         if 'Host' in headers:
             del headers['Host']
@@ -3107,12 +3109,12 @@ class GAEProxyHandler2(AdvancedProxyHandler):
             if 'rc4' in common.GAE_OPTIONS:
                 request_headers['X-GOA-Options'] = 'rc4'
                 cookie = base64.b64encode(rc4crypt(zlib.compress(metadata)[2:-4], kwargs.get('password'))).strip()
-                payload = rc4crypt(payload, kwargs.get('password'))
+                body = rc4crypt(payload, kwargs.get('password'))
             else:
                 cookie = base64.b64encode(zlib.compress(metadata)[2:-4]).strip()
             request_headers['Cookie'] = cookie
-            if payload:
-                request_headers['Content-Length'] = str(len(payload))
+            if body:
+                request_headers['Content-Length'] = str(len(body))
             else:
                 request_method = 'GET'
         else:
@@ -3126,7 +3128,7 @@ class GAEProxyHandler2(AdvancedProxyHandler):
         need_crlf = 0 if common.GAE_MODE == 'https' else 1
         need_validate = common.GAE_VALIDATE
         connection_cache_key = '%s:%d' % (common.HOSTS_POSTFIX_MAP['.appspot.com'], 443 if common.GAE_MODE == 'https' else 80)
-        response = self.create_http_request(request_method, fetchserver, request_headers, payload, self.max_timeout, crlf=need_crlf, validate=need_validate, connection_cache_key=connection_cache_key)
+        response = self.create_http_request(request_method, fetchserver, request_headers, body, self.max_timeout, crlf=need_crlf, validate=need_validate, connection_cache_key=connection_cache_key)
         response.app_status = response.status
         response.app_options = response.getheader('X-GOA-Options', '')
         if response.status != 200:
