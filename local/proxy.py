@@ -1546,7 +1546,7 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         if do_ssl_handshake:
             remote = self.create_ssl_connection(hostname, port, timeout, **kwargs)
         else:
-            sock = self.create_tcp_connection(hostname, port, timeout, **kwargs)
+            remote = self.create_tcp_connection(hostname, port, timeout, **kwargs)
         if remote and not isinstance(remote, Exception):
             self.wfile.write(b'HTTP/1.1 200 OK\r\n\r\n')
         logging.info('%s "FORWARD %s %s:%d %s" - -', self.address_string(), self.command, hostname, port, self.protocol_version)
@@ -2290,7 +2290,7 @@ def gae_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
             zpayload = zlib.compress(payload)[2:-4]
             if len(zpayload) < len(payload):
                 payload = zpayload
-            headers['Content-Encoding'] = 'deflate'
+                headers['Content-Encoding'] = 'deflate'
         headers['Content-Length'] = str(len(payload))
     # GAE donot allow set `Host` header
     if 'Host' in headers:
@@ -2305,7 +2305,7 @@ def gae_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
         if 'rc4' in common.GAE_OPTIONS:
             request_headers['X-GOA-Options'] = 'rc4'
             cookie = base64.b64encode(rc4crypt(zlib.compress(metadata)[2:-4], kwargs.get('password'))).strip()
-            body = rc4crypt(body, kwargs.get('password'))
+            payload = rc4crypt(body, kwargs.get('password'))
         else:
             cookie = base64.b64encode(zlib.compress(metadata)[2:-4]).strip()
         request_headers['Cookie'] = cookie
@@ -2319,7 +2319,7 @@ def gae_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
         if 'rc4' in common.GAE_OPTIONS:
             request_headers['X-GOA-Options'] = 'rc4'
             payload = rc4crypt(payload, kwargs.get('password'))
-        request_headers['Content-Length'] = str(len(body))
+        request_headers['Content-Length'] = str(len(payload))
     # post data
     need_crlf = 0 if common.GAE_MODE == 'https' else 1
     need_validate = common.GAE_VALIDATE
@@ -3109,7 +3109,7 @@ class GAEProxyHandler2(AdvancedProxyHandler):
             if 'rc4' in common.GAE_OPTIONS:
                 request_headers['X-GOA-Options'] = 'rc4'
                 cookie = base64.b64encode(rc4crypt(zlib.compress(metadata)[2:-4], kwargs.get('password'))).strip()
-                body = rc4crypt(payload, kwargs.get('password'))
+                body = rc4crypt(body, kwargs.get('password'))
             else:
                 cookie = base64.b64encode(zlib.compress(metadata)[2:-4]).strip()
             request_headers['Cookie'] = cookie
@@ -3119,11 +3119,11 @@ class GAEProxyHandler2(AdvancedProxyHandler):
                 request_method = 'GET'
         else:
             metadata = zlib.compress(metadata)[2:-4]
-            payload = '%s%s%s' % (struct.pack('!h', len(metadata)), metadata, payload)
+            body = '%s%s%s' % (struct.pack('!h', len(metadata)), metadata, payload)
             if 'rc4' in common.GAE_OPTIONS:
                 request_headers['X-GOA-Options'] = 'rc4'
-                payload = rc4crypt(payload, kwargs.get('password'))
-            request_headers['Content-Length'] = str(len(payload))
+                body = rc4crypt(payload, kwargs.get('password'))
+            request_headers['Content-Length'] = str(len(body))
         # post data
         need_crlf = 0 if common.GAE_MODE == 'https' else 1
         need_validate = common.GAE_VALIDATE
