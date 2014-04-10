@@ -37,11 +37,16 @@
 #      Toshio Xiang      <snachx@gmail.com>
 #      Bo Tian           <dxmtb@163.com>
 
-__version__ = '3.1.7'
+__version__ = '3.1.8'
 
 import sys
 import os
 import glob
+
+default_encoding = 'utf-8'
+if sys.getdefaultencoding() != default_encoding:
+    reload(sys)
+    sys.setdefaultencoding(default_encoding)
 
 sys.dont_write_bytecode = True
 sys.path += glob.glob('%s/*.egg' % os.path.dirname(os.path.abspath(__file__)))
@@ -599,6 +604,20 @@ def spawn_later(seconds, target, *args, **kwargs):
     return __import__('thread').start_new_thread(wrap, args, kwargs)
 
 
+def is_clienthello(data):
+    if len(data) < 20:
+        return False
+    if data.startswith('\x16\x03'):
+        # TLSv12/TLSv11/TLSv1/SSLv3
+        length, = struct.unpack('>h', data[3:5])
+        return len(data) == 5 + length
+    elif data[0] == '\x80' and data[2:4] == '\x01\x03':
+        # SSLv23
+        return len(data) == 2 + ord(data[1])
+    else:
+        return False
+
+
 class BaseProxyHandlerFilter(object):
     """base proxy handler filter"""
     def filter(self, handler):
@@ -614,19 +633,45 @@ class SimpleProxyHandlerFilter(BaseProxyHandlerFilter):
             return [handler.DIRECT]
 
 
+class AuthFilter(BaseProxyHandlerFilter):
+    """authorization filter"""
+    auth_info = "Proxy authentication required"""
+
+    def __init__(self, username, password):
+        self.username = username
+        self.password = password
+
+    def check_auth_header(self, auth_header):
+        method, _, auth_data = auth_header.partition(' ')
+        if method == 'Basic':
+            username, _, password = base64.b64decode(auth_data).partition(':')
+            if username == self.username and password == self.password:
+                return True
+        return False
+
+    def filter(self, handler):
+        if handler.has_auth_filter:
+            auth_header = handler.headers.get('Proxy-Authorization')
+            if not auth_header or not self.check_auth_header(auth_header):
+                headers = {'Access-Control-Allow-Origin': '*',
+                           'Proxy-Authenticate': 'Basic realm="%s"' % self.auth_info,
+                           'Content-Length': '0',
+                           'Connection': 'keep-alive'}
+                return [handler.MOCK, 407, headers, '']
+
+
 class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     """SimpleProxyHandler for GoAgent 3.x"""
 
     protocol_version = 'HTTP/1.1'
     scheme = 'http'
     skip_headers = frozenset(['Vary', 'Via', 'X-Forwarded-For', 'Proxy-Authorization', 'Proxy-Connection', 'Upgrade', 'X-Chrome-Variations', 'Connection', 'Cache-Control'])
-    normcookie = functools.partial(re.compile(', ([^ =]+(?:=|$))').sub, '\\r\\nSet-Cookie: \\1')
-    normattachment = functools.partial(re.compile(r'filename=([^"\']+)').sub, 'filename="\\1"')
     bufsize = 256 * 1024
     max_timeout = 16
     connect_timeout = 8
     first_run_lock = threading.Lock()
     handler_filters = [SimpleProxyHandlerFilter()]
+    has_auth_filter = False
 
     def finish(self):
         """make python2 BaseHTTPRequestHandler happy"""
@@ -648,6 +693,19 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         if self.request_version != 'HTTP/0.9':
             self.wfile.write("%s %d %s\r\n" %
                              (self.protocol_version, code, message))
+
+    def send_header(self, keyword, value):
+        """Send a MIME header."""
+        base_send_header = BaseHTTPServer.BaseHTTPRequestHandler.send_header
+        keyword = keyword.title()
+        if keyword == 'Set-Cookie':
+            for cookie in re.split(r', (?=[^ =]+(?:=|$))', value):
+                base_send_header(self, keyword, cookie)
+        elif keyword == 'Content-Disposition' and '"' not in value:
+            value = re.sub(r'filename=([^"\']+)', 'filename="\\1"', value)
+            base_send_header(self, keyword, value)
+        else:
+            base_send_header(self, keyword, value)
 
     def setup(self):
         if isinstance(self.__class__.first_run, collections.Callable):
@@ -711,7 +769,8 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         logging.info('%s "MOCK %s %s %s" %d %d', self.address_string(), self.command, self.path, self.protocol_version, status, len(content))
         if 'Content-Length' not in headers:
             headers['Content-Length'] = len(content)
-        headers['Connection'] = 'close'
+        if 'Connection' not in headers:
+            headers['Connection'] = 'close'
         self.send_response(status)
         for key, value in headers.items():
             self.send_header(key, value)
@@ -720,6 +779,8 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
     def STRIPSSL(self):
         """strip ssl"""
+        if self.has_auth_filter:
+            self.auth_headers = {k.title(): v for k, v in self.headers.items() if k.title().endswith('-Authorization')}
         certfile = CertUtil.get_cert(self.host)
         logging.info('%s "SSL %s %s:%d %s" - -', self.address_string(), self.command, self.host, self.port, self.protocol_version)
         self.send_response(200)
@@ -760,24 +821,35 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         """forward socket"""
         do_ssl_handshake = kwargs.pop('do_ssl_handshake', False)
         local = self.connection
+        max_retry = int(kwargs.get('max_retry', 3))
         remote = None
-        errors = []
-        for i in xrange(3):
+        self.send_response(200)
+        self.end_headers()
+        self.close_connection = 1
+        data = local.recv(1024)
+        data_is_clienthello = is_clienthello(data)
+        if data_is_clienthello:
+            kwargs['client_hello'] = data
+        for i in xrange(5):
             try:
                 if do_ssl_handshake:
                     remote = self.create_ssl_connection(hostname, port, timeout, **kwargs)
                 else:
                     remote = self.create_tcp_connection(hostname, port, timeout, **kwargs)
-                if remote and not isinstance(remote, Exception):
-                    self.send_response(200)
-                    self.send_header('Connection', 'close')
-                    self.end_headers()
-                    break
+                if not data_is_clienthello and remote and not isinstance(remote, Exception):
+                    remote.sendall(data)
+                break
             except Exception as e:
-                errors.append(e)
-        if not remote:
-            raise error[-1]
+                logging.exception('%s "FWD %s %s:%d %s" %r', self.address_string(), self.command, hostname, port, self.protocol_version, e)
+                if hasattr(remote, 'close'):
+                    remote.close()
+                if i == max_retry - 1:
+                    raise
         logging.info('%s "FWD %s %s:%d %s" - -', self.address_string(), self.command, hostname, port, self.protocol_version)
+        if hasattr(remote, 'fileno'):
+            # reset timeout default to avoid long http upload failure, but it will delay timeout retry :(
+            remote.settimeout(None)
+        del kwargs
         try:
             tick = 1
             bufsize = self.bufsize
@@ -804,6 +876,8 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         except NetWorkIOError as e:
             if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET, errno.ENOTCONN, errno.EPIPE):
                 raise
+            if e.args[0] in (errno.EBADF,):
+                return
         finally:
             if local:
                 local.close()
@@ -817,15 +891,12 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         else:
             url = 'http://%s%s' % (self.headers['Host'], self.path)
         headers = {k.title(): v for k, v in self.headers.items()}
-        body = self.rfile.read(int(headers.get('Content-Length', 0)))
+        body = self.body
         response = self.create_http_request(method, url, headers, body, timeout=self.connect_timeout, **kwargs)
         logging.info('%s "DIRECT %s %s %s" %s %s', self.address_string(), self.command, url, self.protocol_version, response.status, response.getheader('Content-Length', '-'))
         response_headers = {k.title(): v for k, v in response.getheaders()}
-        if 'Set-Cookie' in response_headers:
-            response_headers['Set-Cookie'] = self.normcookie(response_headers['Set-Cookie'])
         self.send_response(response.status)
         for key, value in response.getheaders():
-            key = key.title()
             self.send_header(key, value)
         self.end_headers()
         need_chunked = 'Transfer-Encoding' in response_headers
@@ -862,7 +933,7 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         fetchserver = fetchservers[0]
         for i in xrange(max_retry):
             try:
-                response = self.create_http_request_withserver(fetchserver, method, url, headers, body, timeout=self.max_timeout, **kwargs)
+                response = self.create_http_request_withserver(fetchserver, method, url, headers, body, timeout=self.connect_timeout, **kwargs)
                 # appid over qouta, switch to next appid
                 if response.app_status >= 500:
                     message = {503: 'Current APPID Over Quota'}.get(response.status) or 'URLFETCH retrun %s' % response.status
@@ -879,13 +950,8 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     logging.info('%s "URL %s %s %s" %s %s', self.address_string(), method, url, self.protocol_version, response.status, response.getheader('Content-Length', '-'))
                     if response.status == 206:
                         return RangeFetch(self, response, fetchservers, **kwargs).fetch()
-                    if response.getheader('Set-Cookie'):
-                        response.msg['Set-Cookie'] = self.normcookie(response.getheader('Set-Cookie'))
-                    if response.getheader('Content-Disposition') and '"' not in response.getheader('Content-Disposition'):
-                        response.msg['Content-Disposition'] = self.normattachment(response.getheader('Content-Disposition'))
                     self.send_response(response.status)
                     for key, value in response.getheaders():
-                        key = key.title()
                         self.send_header(key, value)
                     self.end_headers()
                     headers_sent = True
@@ -942,6 +1008,13 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         else:
             self.host = netloc
             self.port = 443 if self.scheme == 'http' else 80
+        if self.has_auth_filter:
+            auth_headers = {k.title(): v for k, v in self.headers.items() if k.title().endswith('-Authorization')}
+            original_auth_headers = getattr(self, 'auth_headers', {})
+            if auth_headers or original_auth_headers:
+                for key, value in original_auth_headers.items():
+                    if key not in auth_headers:
+                        self.headers[key] = value
         self.body = self.rfile.read(int(self.headers['Content-Length'])) if 'Content-Length' in self.headers else ''
         for handler_filter in self.handler_filters:
             action = handler_filter.filter(self)
@@ -965,6 +1038,7 @@ class RangeFetch(object):
         self.kwargs = kwargs
         self._stopped = None
         self._last_app_status = {}
+        self.expect_begin = 0
 
     def fetch(self):
         response_status = self.response.status
@@ -989,6 +1063,7 @@ class RangeFetch(object):
         data_queue = Queue.PriorityQueue()
         range_queue = Queue.PriorityQueue()
         range_queue.put((start, end, self.response))
+        self.expect_begin = start
         for begin in range(end+1, length, self.maxsize):
             range_queue.put((begin, min(begin+self.maxsize-1, length-1), None))
         for i in xrange(0, self.threads):
@@ -996,7 +1071,6 @@ class RangeFetch(object):
             spawn_later(float(range_delay_size)/self.waitsize, self.__fetchlet, range_queue, data_queue, range_delay_size)
         has_peek = hasattr(data_queue, 'peek')
         peek_timeout = 120
-        self.expect_begin = start
         while self.expect_begin < length - 1:
             try:
                 if has_peek:
@@ -1051,7 +1125,7 @@ class RangeFetch(object):
                         fetchserver = random.choice(self.fetchservers)
                         if self._last_app_status.get(fetchserver, 200) >= 500:
                             time.sleep(5)
-                        response = self.handler.create_http_request_withserver(fetchserver, self.handler.command, self.url, headers, self.handler.body, timeout=self.handler.max_timeout, **self.kwargs)
+                        response = self.handler.create_http_request_withserver(fetchserver, self.handler.command, self.url, headers, self.handler.body, timeout=self.handler.connect_timeout, **self.kwargs)
                 except Queue.Empty:
                     continue
                 except Exception as e:
@@ -1136,8 +1210,9 @@ class AdvancedProxyHandler(SimpleProxyHandler):
         return iplist
 
     def create_tcp_connection(self, hostname, port, timeout, **kwargs):
-        cache_key = kwargs.get('cache_key')
+        #cache_key = kwargs.get('cache_key')
         cache_key = ''
+        client_hello = kwargs.get('client_hello', None)
         def create_connection(ipaddr, timeout, queobj):
             sock = None
             try:
@@ -1150,37 +1225,45 @@ class AdvancedProxyHandler(SimpleProxyHandler):
                 # disable nagle algorithm to send http request quickly.
                 sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, True)
                 # set a short timeout to trigger timeout retry more quickly.
-                sock.settimeout(timeout or self.max_timeout)
+                sock.settimeout(timeout or self.connect_timeout)
                 # start connection time record
                 start_time = time.time()
                 # TCP connect
                 sock.connect(ipaddr)
                 # record TCP connection time
                 self.tcp_connection_time[ipaddr] = time.time() - start_time
-                # put ssl socket object to output queobj
+                # send client hello and peek server hello
+                if client_hello:
+                    sock.sendall(client_hello)
+                    if hasattr(socket, 'MSG_PEEK'):
+                        peek_data = sock.recv(1, socket.MSG_PEEK)
+                        if not peek_data:
+                            logging.debug('create_tcp_connection %r with client_hello return NULL byte, continue %r', ipaddr, time.time()-start_time)
+                            raise socket.error('timed out')
+                # put tcp socket object to output queobj
                 queobj.put(sock)
             except (socket.error, OSError) as e:
                 # any socket.error, put Excpetions to output queobj.
                 queobj.put(e)
                 # reset a large and random timeout to the ipaddr
-                self.tcp_connection_time[ipaddr] = self.max_timeout+random.random()
+                self.tcp_connection_time[ipaddr] = self.connect_timeout+random.random()
                 # close tcp socket
                 if sock:
                     sock.close()
         def close_connection(count, queobj, first_tcp_time):
             for _ in range(count):
                 sock = queobj.get()
-                tcp_time_threshold = min(1, 1.5 * first_tcp_time)
+                tcp_time_threshold = min(1, 1.3 * first_tcp_time)
                 if sock and not isinstance(sock, Exception):
                     ipaddr = sock.getpeername()
-                    if cache_key and self.tcp_connection_time[ipaddr] < tcp_time_threshold:
-                        self.ssl_connection_cache[cache_key].put((time.time(), sock))
+                    if cache_key and self.tcp_connection_time[ipaddr] < tcp_time_threshold and not client_hello:
+                        self.tcp_connection_cache[cache_key].put((time.time(), sock))
                     else:
                         sock.close()
         try:
             while cache_key:
                 ctime, sock = self.tcp_connection_cache[cache_key].get_nowait()
-                if time.time() - ctime < 16:
+                if time.time() - ctime < 30:
                     return sock
                 else:
                     sock.close()
@@ -1188,23 +1271,20 @@ class AdvancedProxyHandler(SimpleProxyHandler):
             pass
         result = None
         addresses = [(x, port) for x in self.gethostbyname2(hostname)]
-        if port == 443:
-            get_connection_time = lambda addr: self.ssl_connection_time.__getitem__(addr) or self.tcp_connection_time.__getitem__(addr)
-        else:
-            get_connection_time = self.tcp_connection_time.__getitem__
         errors = []
         for i in range(3):
-            window = min((self.max_window+1)//2 + min(i, 1), len(addresses))
-            addresses.sort(key=get_connection_time)
-            addrs = addresses[:window] + random.sample(addresses, min(len(addresses), window, self.max_window-window))
-            queobj = Queue.Queue()
+            window = min((self.max_window+1)//2, len(addresses))
+            addresses.sort(key=self.tcp_connection_time.__getitem__)
+            addrs = addresses[:window] + random.sample(addresses, window)
+            queobj = gevent.queue.Queue() if gevent else Queue.Queue()
             for addr in addrs:
                 thread.start_new_thread(create_connection, (addr, timeout, queobj))
             for i in range(len(addrs)):
                 result = queobj.get()
                 if not isinstance(result, (socket.error, OSError)):
-                    ipaddr = result.getpeername()
-                    thread.start_new_thread(close_connection, (len(addrs)-i-1, queobj, self.tcp_connection_time[ipaddr]))
+                    # first_tcp_time = self.tcp_connection_time[result.getpeername()]
+                    first_tcp_time = 0
+                    thread.start_new_thread(close_connection, (len(addrs)-i-1, queobj, first_tcp_time))
                     return result
                 else:
                     if i == 0:
@@ -1229,7 +1309,7 @@ class AdvancedProxyHandler(SimpleProxyHandler):
                 # disable negal algorithm to send http request quickly.
                 sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, True)
                 # set a short timeout to trigger timeout retry more quickly.
-                sock.settimeout(timeout or self.max_timeout)
+                sock.settimeout(timeout or self.connect_timeout)
                 # pick up the certificate
                 if not validate:
                     ssl_sock = ssl.wrap_socket(sock, do_handshake_on_connect=False)
@@ -1283,7 +1363,7 @@ class AdvancedProxyHandler(SimpleProxyHandler):
                 # disable negal algorithm to send http request quickly.
                 sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, True)
                 # set a short timeout to trigger timeout retry more quickly.
-                sock.settimeout(timeout or self.max_timeout)
+                sock.settimeout(timeout or self.connect_timeout)
                 # pick up the certificate
                 server_hostname = b'www.google.com' if hostname.endswith('.appspot.com') else None
                 ssl_sock = SSLConnection(self.openssl_context, sock)
@@ -1316,7 +1396,7 @@ class AdvancedProxyHandler(SimpleProxyHandler):
                 # any socket.error, put Excpetions to output queobj.
                 queobj.put(e)
                 # reset a large and random timeout to the ipaddr
-                self.ssl_connection_time[ipaddr] = self.max_timeout + random.random()
+                self.ssl_connection_time[ipaddr] = self.connect_timeout + random.random()
                 # close ssl socket
                 if ssl_sock:
                     ssl_sock.close()
@@ -1326,7 +1406,7 @@ class AdvancedProxyHandler(SimpleProxyHandler):
         def close_connection(count, queobj, first_tcp_time, first_ssl_time):
             for _ in range(count):
                 sock = queobj.get()
-                ssl_time_threshold = min(1, 1.5 * first_ssl_time)
+                ssl_time_threshold = min(1, 1.3 * first_ssl_time)
                 if sock and not isinstance(sock, Exception):
                     if cache_key and sock.ssl_time < ssl_time_threshold:
                         self.ssl_connection_cache[cache_key].put((time.time(), sock))
@@ -1335,7 +1415,7 @@ class AdvancedProxyHandler(SimpleProxyHandler):
         try:
             while cache_key:
                 ctime, sock = self.ssl_connection_cache[cache_key].get_nowait()
-                if time.time() - ctime < 16:
+                if time.time() - ctime < 30:
                     return sock
                 else:
                     sock.close()
@@ -1344,10 +1424,10 @@ class AdvancedProxyHandler(SimpleProxyHandler):
         result = None
         addresses = [(x, port) for x in self.gethostbyname2(hostname)]
         for i in range(3):
-            window = min((self.max_window+1)//2 + min(i, 1), len(addresses))
+            window = min((self.max_window+1)//2, len(addresses))
             addresses.sort(key=self.ssl_connection_time.__getitem__)
-            addrs = addresses[:window] + random.sample(addresses, min(len(addresses), window, self.max_window-window))
-            queobj = Queue.Queue()
+            addrs = addresses[:window] + random.sample(addresses, window)
+            queobj = gevent.queue.Queue() if gevent else Queue.Queue()
             for addr in addrs:
                 thread.start_new_thread(create_connection, (addr, timeout, queobj))
             errors = []
@@ -1464,6 +1544,8 @@ class Common(object):
 
         self.LISTEN_IP = self.CONFIG.get('listen', 'ip')
         self.LISTEN_PORT = self.CONFIG.getint('listen', 'port')
+        self.LISTEN_USERNAME = self.CONFIG.get('listen', 'username') if self.CONFIG.has_option('listen', 'username') else ''
+        self.LISTEN_PASSWORD = self.CONFIG.get('listen', 'password') if self.CONFIG.has_option('listen', 'password') else ''
         self.LISTEN_VISIBLE = self.CONFIG.getint('listen', 'visible')
         self.LISTEN_DEBUGINFO = self.CONFIG.getint('listen', 'debuginfo')
 
@@ -1579,7 +1661,7 @@ class Common(object):
                 logging.error('resolve remote host=%r failed: %s', host, e)
                 queue.put((host, dnsservers, []))
         # https://support.google.com/websearch/answer/186669?hl=zh-Hans
-        google_blacklist = ['216.239.32.20', '74.125.127.102', '74.125.155.102', '74.125.39.102', '74.125.39.113', '209.85.229.138']
+        google_blacklist = ['216.239.32.20'] + list(common.DNS_BLACKLIST)
         for name, need_resolve_hosts in list(self.IPLIST_MAP.items()):
             if all(re.match(r'\d+\.\d+\.\d+\.\d+', x) or ':' in x for x in need_resolve_hosts):
                 continue
@@ -1760,6 +1842,13 @@ class LocalProxyServer(SocketServer.ThreadingTCPServer):
             SocketServer.ThreadingTCPServer.handle_error(self, *args)
 
 
+class UserAgentFilter(BaseProxyHandlerFilter):
+    """user agent filter"""
+    def filter(self, handler):
+        if common.USERAGENT_ENABLE:
+            handler.headers['User-Agent'] = common.USERAGENT_STRING
+
+
 class WithGAEFilter(BaseProxyHandlerFilter):
     """with gae filter"""
     def filter(self, handler):
@@ -1918,8 +2007,8 @@ class GAEFetchFilter(BaseProxyHandlerFilter):
 
 
 class GAEProxyHandler(AdvancedProxyHandler):
-    """GAE Proxy Handler 2"""
-    handler_filters = [WithGAEFilter(), FakeHttpsFilter(), ForceHttpsFilter(), HostsFilter(), DirectRegionFilter(), AutoRangeFilter(), GAEFetchFilter()]
+    """GAE Proxy Handler"""
+    handler_filters = [UserAgentFilter(), WithGAEFilter(), FakeHttpsFilter(), ForceHttpsFilter(), HostsFilter(), DirectRegionFilter(), AutoRangeFilter(), GAEFetchFilter()]
 
     def first_run(self):
         """GAEProxyHandler setup, init domain/iplist map"""
@@ -2018,9 +2107,9 @@ class PHPFetchFilter(BaseProxyHandlerFilter):
 
 
 class PHPProxyHandler(AdvancedProxyHandler):
-    """PHP Proxy Handler 2"""
+    """PHP Proxy Handler"""
     first_run_lock = threading.Lock()
-    handler_filters = [FakeHttpsFilter(), ForceHttpsFilter(), PHPFetchFilter()]
+    handler_filters = [UserAgentFilter(), FakeHttpsFilter(), ForceHttpsFilter(), PHPFetchFilter()]
 
     def first_run(self):
         if common.PHP_USEHOSTS:
@@ -2064,7 +2153,6 @@ class PHPProxyHandler(AdvancedProxyHandler):
             return response
         response.app_status = response.status
         need_decrypt = kwargs.get('password') and response.app_status == 200 and response.getheader('Content-Type', '') == 'image/gif' and response.fp
-        transfer_encoding = response.getheader('Transfer-Encoding', '')
         if need_decrypt:
             response.fp = CipherFileObject(response.fp, XORCipher(kwargs['password'][0]))
         self.close_connection = 1
@@ -2086,7 +2174,7 @@ class ProxyChainMixin:
             hostname = 'www.google.com'
         request_data = 'CONNECT %s:%s HTTP/1.1\r\n' % (hostname, port)
         if common.PROXY_USERNAME and common.PROXY_PASSWROD:
-            request_data += 'Proxy-authorization: Basic %s\r\n' % base64.b64encode(('%s:%s' % (common.PROXY_USERNAME, common.PROXY_PASSWROD)).encode()).decode().strip()
+            request_data += 'Proxy-Authorization: Basic %s\r\n' % base64.b64encode(('%s:%s' % (common.PROXY_USERNAME, common.PROXY_PASSWROD)).encode()).decode().strip()
         request_data += '\r\n'
         sock.sendall(request_data)
         response = httplib.HTTPResponse(sock, buffering=False)
@@ -2125,6 +2213,7 @@ class GreenForwardMixin:
 
     def FORWARD(self, hostname, port, timeout, kwargs={}):
         """forward socket"""
+        self.close_connection = 1
         bufsize = kwargs.pop('bufsize', 8192)
         do_ssl_handshake = kwargs.pop('do_ssl_handshake', False)
         local = self.connection
@@ -2258,7 +2347,7 @@ class PacUtil(object):
             logging.info('%r successfully updated', filename)
 
     @staticmethod
-    def autoproxy2pac(content, func_name='FindProxyForURLByAutoProxy', proxy='127.0.0.1:8087', default='DIRECT', indent=4):
+    def autoproxy2pac(content, func_name='FindProxyForURLByAutoProxy', proxy='127.0.0.1:1998', default='DIRECT', indent=4):
         """Autoproxy to Pac, based on https://github.com/iamamac/autoproxy2pac"""
         jsLines = []
         for line in content.splitlines()[1:]:
@@ -2292,7 +2381,7 @@ class PacUtil(object):
         return function
 
     @staticmethod
-    def autoproxy2pac_lite(content, func_name='FindProxyForURLByAutoProxy', proxy='127.0.0.1:8087', default='DIRECT', indent=4):
+    def autoproxy2pac_lite(content, func_name='FindProxyForURLByAutoProxy', proxy='127.0.0.1:1998', default='DIRECT', indent=4):
         """Autoproxy to Pac, based on https://github.com/iamamac/autoproxy2pac"""
         direct_domain_set = set([])
         proxy_domain_set = set([])
@@ -2349,7 +2438,7 @@ class PacUtil(object):
         return template % (func_name, jsLines, func_name, func_name, proxy, default)
 
     @staticmethod
-    def urlfilter2pac(content, func_name='FindProxyForURLByUrlfilter', proxy='127.0.0.1:8086', default='DIRECT', indent=4):
+    def urlfilter2pac(content, func_name='FindProxyForURLByUrlfilter', proxy='127.0.0.1:1999', default='DIRECT', indent=4):
         """urlfilter.ini to Pac, based on https://github.com/iamamac/autoproxy2pac"""
         jsLines = []
         for line in content[content.index('[exclude]'):].splitlines()[1:]:
@@ -2372,7 +2461,7 @@ class PacUtil(object):
         return function
 
     @staticmethod
-    def adblock2pac(content, func_name='FindProxyForURLByAdblock', proxy='127.0.0.1:8086', default='DIRECT', indent=4):
+    def adblock2pac(content, func_name='FindProxyForURLByAdblock', proxy='127.0.0.1:1999', default='DIRECT', indent=4):
         """adblock list to Pac, based on https://github.com/iamamac/autoproxy2pac"""
         white_conditions = []
         black_conditions = []
@@ -2497,6 +2586,8 @@ class StaticFileFilter(BaseProxyHandlerFilter):
                 with open(filename, 'rb') as fp:
                     content = fp.read()
                     headers = {'Content-Type': 'application/octet-stream', 'Connection': 'close'}
+                    if path.endswith('pac'):
+                        headers['Content-Type'] = 'text/plain'
                     return [handler.MOCK, 200, headers, content]
 
 
@@ -2508,7 +2599,7 @@ class BlackholeFilter(BaseProxyHandlerFilter):
         urlparts = urlparse.urlsplit(handler.path)
         if handler.command == 'CONNECT':
             return [handler.STRIPSSL]
-        elif handler.path.startswith(('http', 'https')):
+        elif handler.path.startswith(('http://', 'https://')):
             headers = {'Cache-Control': 'max-age=86400',
                        'Expires': 'Oct, 01 Aug 2100 00:00:00 GMT',
                        'Connection': 'close'}
@@ -2536,7 +2627,7 @@ def get_process_list():
     if os.name == 'nt':
         PROCESS_QUERY_INFORMATION = 0x0400
         PROCESS_VM_READ = 0x0010
-        lpidProcess= (ctypes.c_ulong * 1024)()
+        lpidProcess = (ctypes.c_ulong * 1024)()
         cb = ctypes.sizeof(lpidProcess)
         cbNeeded = ctypes.c_ulong()
         ctypes.windll.psapi.EnumProcesses(ctypes.byref(lpidProcess), cb, ctypes.byref(cbNeeded))
@@ -2629,7 +2720,7 @@ def pre_start():
         sys.exit(-1)
     if not common.DNS_ENABLE:
         for dnsservers_ref in (common.HTTP_DNS, common.DNS_SERVERS):
-            any(common.DNS_SERVERS.insert(0, x) for x in [y for y in get_dnsserver_list() if y not in common.DNS_SERVERS])
+            any(dnsservers_ref.insert(0, x) for x in [y for y in get_dnsserver_list() if y not in dnsservers_ref])
         AdvancedProxyHandler.dns_servers = common.HTTP_DNS
         AdvancedProxyHandler.dns_blacklist = common.DNS_BLACKLIST
     if not OpenSSL:
@@ -2638,6 +2729,10 @@ def pre_start():
     RangeFetch.maxsize = common.AUTORANGE_MAXSIZE
     RangeFetch.bufsize = common.AUTORANGE_BUFSIZE
     RangeFetch.waitsize = common.AUTORANGE_WAITSIZE
+    GAEProxyHandler.has_auth_filter = any(isinstance(x, AuthFilter) for x in GAEProxyHandler.handler_filters)
+    if common.LISTEN_USERNAME and common.LISTEN_PASSWORD and not GAEProxyHandler.has_auth_filter:
+        GAEProxyHandler.handler_filters.insert(0, AuthFilter(common.LISTEN_USERNAME, common.LISTEN_PASSWORD))
+        GAEProxyHandler.has_auth_filter = True
 
 class gfanqiang():      
     def updateappid(self):
