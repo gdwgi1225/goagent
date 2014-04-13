@@ -818,16 +818,19 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         """forward socket"""
         do_ssl_handshake = kwargs.pop('do_ssl_handshake', False)
         local = self.connection
-        max_retry = int(kwargs.get('max_retry', 3))
         remote = None
         self.send_response(200)
         self.end_headers()
         self.close_connection = 1
         data = local.recv(1024)
+        if not data:
+            local.close()
+            return
         data_is_clienthello = is_clienthello(data)
         if data_is_clienthello:
             kwargs['client_hello'] = data
-        for i in xrange(5):
+        max_retry = kwargs.get('max_retry', 3)
+        for i in xrange(max_retry):
             try:
                 if do_ssl_handshake:
                     remote = self.create_ssl_connection(hostname, port, timeout, **kwargs)
@@ -876,10 +879,11 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             if e.args[0] in (errno.EBADF,):
                 return
         finally:
-            if local:
-                local.close()
-            if remote:
-                remote.close()
+            for sock in (remote, local):
+                try:
+                    sock.close()
+                except:
+                    pass
 
     def DIRECT(self, kwargs):
         method = self.command
@@ -1504,10 +1508,7 @@ class AdvancedProxyHandler(SimpleProxyHandler):
             logging.exception('crlf skip read host=%r path=%r error: %r', headers.get('Host'), path, e)
             return None
         response = httplib.HTTPResponse(sock, buffering=True)
-        try:
-            response.begin()
-        except httplib.BadStatusLine:
-            response = None
+        response.begin()
         return response
 
 
@@ -2193,24 +2194,49 @@ class GreenForwardMixin:
             if e.args[0] not in ('timed out', errno.ECONNABORTED, errno.ECONNRESET, errno.EBADF, errno.EPIPE, errno.ENOTCONN, errno.ETIMEDOUT):
                 raise
         finally:
-            if dest:
-                dest.close()
-            if source:
-                source.close()
+            for sock in (dest, source):
+                try:
+                    sock.close()
+                except:
+                    pass
 
     def FORWARD(self, hostname, port, timeout, kwargs={}):
         """forward socket"""
-        self.close_connection = 1
-        bufsize = kwargs.pop('bufsize', 8192)
         do_ssl_handshake = kwargs.pop('do_ssl_handshake', False)
+        bufsize = self.bufsize
         local = self.connection
-        if do_ssl_handshake:
-            remote = self.create_ssl_connection(hostname, port, timeout, **kwargs)
-        else:
-            remote = self.create_tcp_connection(hostname, port, timeout, **kwargs)
-        if remote and not isinstance(remote, Exception):
-            self.wfile.write(b'HTTP/1.1 200 OK\r\n\r\n')
-        logging.info('%s "GREEN FORWARD %s %s:%d %s" - -', self.address_string(), self.command, hostname, port, self.protocol_version)
+        remote = None
+        self.send_response(200)
+        self.end_headers()
+        self.close_connection = 1
+        data = local.recv(1024)
+        if not data:
+            local.close()
+            return
+        data_is_clienthello = is_clienthello(data)
+        if data_is_clienthello:
+            kwargs['client_hello'] = data
+        max_retry = kwargs.get('max_retry', 3)
+        for i in xrange(max_retry):
+            try:
+                if do_ssl_handshake:
+                    remote = self.create_ssl_connection(hostname, port, timeout, **kwargs)
+                else:
+                    remote = self.create_tcp_connection(hostname, port, timeout, **kwargs)
+                if not data_is_clienthello and remote and not isinstance(remote, Exception):
+                    remote.sendall(data)
+                break
+            except Exception as e:
+                logging.exception('%s "FWD %s %s:%d %s" %r', self.address_string(), self.command, hostname, port, self.protocol_version, e)
+                if hasattr(remote, 'close'):
+                    remote.close()
+                if i == max_retry - 1:
+                    raise
+        logging.info('%s "FWD %s %s:%d %s" - -', self.address_string(), self.command, hostname, port, self.protocol_version)
+        if hasattr(remote, 'fileno'):
+            # reset timeout default to avoid long http upload failure, but it will delay timeout retry :(
+            remote.settimeout(None)
+        del kwargs
         thread.start_new_thread(GreenForwardMixin.io_copy, (remote.dup(), local.dup(), timeout, bufsize))
         GreenForwardMixin.io_copy(local, remote, timeout, bufsize)
 
@@ -2529,22 +2555,14 @@ class PacUtil(object):
                 black_conditions += jsCondition
             else:
                 white_conditions += jsCondition
-        black_lines = ' ||\r\n'.join('%s%s' % (' '*(4+indent), x.replace('**', '*')) for x in black_conditions).strip()
-        # white_lines = ' ||\r\n'.join('%s%s' % (' '*(4+indent), x.replace('**', '*')) for x in white_conditions).strip()
-        white_lines = 'false'
         template = '''\
                     function %s(url, host) {
                         // untrusted ablock plus list, disable whitelist until chinalist come back.
-                        // if (%s) {
-                        //    return "%s";
-                        // }
-                        if (%s) {
-                            return "PROXY %s";
-                        }
+                    %s
                         return "%s";
                     }'''
         template = re.sub(r'(?m)^\s{%d}' % min(len(re.search(r' +', x).group()) for x in template.splitlines()), '', template)
-        return template % (func_name, white_lines, default, black_lines, proxy, default)
+        return template % (func_name, '\r\n'.join('%sif (%s) return "%s";' % (' '*indent, line, proxy) for line in black_conditions) , default)
 
 
 class PacFileFilter(BaseProxyHandlerFilter):
@@ -2561,6 +2579,17 @@ class PacFileFilter(BaseProxyHandlerFilter):
                 uptime = get_uptime()
                 if uptime and uptime > 1800:
                     thread.start_new_thread(lambda: os.utime(pacfile, (time.time(), time.time())) or PacUtil.update_pacfile(pacfile), tuple())
+                    if path.endswith('pac'):
+                        headers['Content-Type'] = 'text/plainplain'
+                    if 'gzip' in handler.headers.get('Accept-Encoding'):
+                        headers['Content-Encoding'] = 'gzip'
+                        compressobj = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL, 0)
+                        dataio = io.BytesIO()
+                        dataio.write('\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff')
+                        dataio.write(compressobj.compress(content))
+                        dataio.write(compressobj.flush())
+                        dataio.write(struct.pack('<LL', zlib.crc32(content) & 0xFFFFFFFFL, len(content) & 0xFFFFFFFFL))
+                        content = dataio.getvalue()
 
 
 class StaticFileFilter(BaseProxyHandlerFilter):
@@ -2573,8 +2602,6 @@ class StaticFileFilter(BaseProxyHandlerFilter):
                 with open(filename, 'rb') as fp:
                     content = fp.read()
                     headers = {'Content-Type': 'application/octet-stream', 'Connection': 'close'}
-                    if path.endswith('pac'):
-                        headers['Content-Type'] = 'text/plain'
                     return [handler.MOCK, 200, headers, content]
 
 
