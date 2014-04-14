@@ -37,7 +37,7 @@
 #      Toshio Xiang      <snachx@gmail.com>
 #      Bo Tian           <dxmtb@163.com>
 
-__version__ = '3.1.8'
+__version__ = '3.1.9'
 
 import sys
 import os
@@ -208,9 +208,11 @@ class LRUCache(object):
             self.key_order.remove(key)
         self.key_order.insert(0, key)
         if len(self.key_order) > self.max_items:
-            remove = self.key_order[self.max_items]
-            del self.cache[remove]
-            self.key_order.pop(self.max_items)
+            index = self.max_items // 2
+            delitem = self.cache.__delitem__
+            key_order = self.key_order
+            any(delitem(key_order[x]) for x in xrange(index, len(key_order)))
+            self.key_order = self.key_order[:index]
 
     def clear(self):
         self.cache = {}
@@ -646,14 +648,13 @@ class AuthFilter(BaseProxyHandlerFilter):
         return False
 
     def filter(self, handler):
-        if handler.has_auth_filter:
-            auth_header = handler.headers.get('Proxy-Authorization')
-            if not auth_header or not self.check_auth_header(auth_header):
-                headers = {'Access-Control-Allow-Origin': '*',
-                           'Proxy-Authenticate': 'Basic realm="%s"' % self.auth_info,
-                           'Content-Length': '0',
-                           'Connection': 'keep-alive'}
-                return [handler.MOCK, 407, headers, '']
+        auth_header = handler.headers.get('Proxy-Authorization')
+        if not auth_header or not self.check_auth_header(auth_header):
+            headers = {'Access-Control-Allow-Origin': '*',
+                       'Proxy-Authenticate': 'Basic realm="%s"' % self.auth_info,
+                       'Content-Length': '0',
+                       'Connection': 'keep-alive'}
+            return [handler.MOCK, 407, headers, '']
 
 
 class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
@@ -668,7 +669,7 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     connect_timeout = 8
     first_run_lock = threading.Lock()
     handler_filters = [SimpleProxyHandlerFilter()]
-    has_auth_filter = False
+    stripssl_handler_filter = None
 
     def finish(self):
         """make python2 BaseHTTPRequestHandler happy"""
@@ -761,6 +762,58 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     def create_http_request_withserver(self, fetchserver, method, url, headers, body, timeout, **kwargs):
         raise NotImplementedError
 
+    def parse_header(self):
+        if self.command == 'CONNECT':
+            netloc = self.path
+        elif self.path[0] == '/':
+            netloc = self.headers.get('Host', 'localhost')
+            self.path = '%s://%s%s' % (self.scheme, netloc, self.path)
+        else:
+            netloc = urlparse.urlsplit(self.path).netloc
+        m = re.match(r'^(.+):(\d+)$', netloc)
+        if m:
+            self.host = m.group(1).strip('[]')
+            self.port = int(m.group(2))
+        else:
+            self.host = netloc
+            self.port = 443 if self.scheme == 'https' else 80
+
+    def forward_socket(self, local, remote, timeout):
+        try:
+            tick = 1
+            bufsize = self.bufsize
+            timecount = timeout
+            while 1:
+                timecount -= tick
+                if timecount <= 0:
+                    break
+                (ins, _, errors) = select.select([local, remote], [], [local, remote], tick)
+                if errors:
+                    break
+                for sock in ins:
+                    data = sock.recv(bufsize)
+                    if not data:
+                        break
+                    if sock is remote:
+                        local.sendall(data)
+                        timecount = timeout
+                    else:
+                        remote.sendall(data)
+                        timecount = timeout
+        except socket.timeout:
+            pass
+        except NetWorkIOError as e:
+            if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET, errno.ENOTCONN, errno.EPIPE):
+                raise
+            if e.args[0] in (errno.EBADF,):
+                return
+        finally:
+            for sock in (remote, local):
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
     def MOCK(self, status, headers, content):
         """mock response"""
         logging.info('%s "MOCK %s %s %s" %d %d', self.address_string(), self.command, self.path, self.protocol_version, status, len(content))
@@ -774,10 +827,8 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
-    def STRIPSSL(self):
+    def STRIPSSL(self, stripssl_handler_filter=None):
         """strip ssl"""
-        if self.has_auth_filter:
-            self.auth_headers = {k.title(): v for k, v in self.headers.items() if k.title().endswith('-Authorization')}
         certfile = CertUtil.get_cert(self.host)
         logging.info('%s "SSL %s %s:%d %s" - -', self.address_string(), self.command, self.host, self.port, self.protocol_version)
         self.send_response(200)
@@ -808,6 +859,7 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET, errno.EPIPE):
                 raise
         self.scheme = 'https'
+        self.stripssl_handler_filter = stripssl_handler_filter
         try:
             self.do_METHOD()
         except NetWorkIOError as e:
@@ -850,40 +902,7 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             # reset timeout default to avoid long http upload failure, but it will delay timeout retry :(
             remote.settimeout(None)
         del kwargs
-        try:
-            tick = 1
-            bufsize = self.bufsize
-            timecount = timeout
-            while 1:
-                timecount -= tick
-                if timecount <= 0:
-                    break
-                (ins, _, errors) = select.select([local, remote], [], [local, remote], tick)
-                if errors:
-                    break
-                if ins:
-                    for sock in ins:
-                        data = sock.recv(bufsize)
-                        if data:
-                            if sock is remote:
-                                local.sendall(data)
-                                timecount = timeout
-                            else:
-                                remote.sendall(data)
-                                timecount = timeout
-                        else:
-                            return
-        except NetWorkIOError as e:
-            if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET, errno.ENOTCONN, errno.EPIPE):
-                raise
-            if e.args[0] in (errno.EBADF,):
-                return
-        finally:
-            for sock in (remote, local):
-                try:
-                    sock.close()
-                except:
-                    pass
+        self.forward_socket(local, remote, self.max_timeout)
 
     def DIRECT(self, kwargs):
         method = self.command
@@ -895,15 +914,16 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             url = 'http://%s%s' % (self.headers['Host'], self.path)
         headers = {k.title(): v for k, v in self.headers.items()}
         body = self.body
-        response = self.create_http_request(method, url, headers, body, timeout=self.connect_timeout, **kwargs)
-        logging.info('%s "DIRECT %s %s %s" %s %s', self.address_string(), self.command, url, self.protocol_version, response.status, response.getheader('Content-Length', '-'))
-        response_headers = {k.title(): v for k, v in response.getheaders()}
-        self.send_response(response.status)
-        for key, value in response.getheaders():
-            self.send_header(key, value)
-        self.end_headers()
-        need_chunked = 'Transfer-Encoding' in response_headers
+        response = None
         try:
+            response = self.create_http_request(method, url, headers, body, timeout=self.connect_timeout, **kwargs)
+            logging.info('%s "DIRECT %s %s %s" %s %s', self.address_string(), self.command, url, self.protocol_version, response.status, response.getheader('Content-Length', '-'))
+            response_headers = {k.title(): v for k, v in response.getheaders()}
+            self.send_response(response.status)
+            for key, value in response.getheaders():
+                self.send_header(key, value)
+            self.end_headers()
+            need_chunked = 'Transfer-Encoding' in response_headers
             while True:
                 data = response.read(8192)
                 if not data:
@@ -916,8 +936,14 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 if need_chunked:
                     self.wfile.write('\r\n')
                 del data
+        except (ssl.SSLError, socket.timeout, socket.error):
+            if response:
+                if response.fp and response.fp._sock:
+                    response.fp._sock.close()
+                response.close()
         finally:
-            response.close()
+            if response:
+                response.close()
 
     def URLFETCH(self, fetchservers, max_retry=2, raw_response=False, kwargs={}):
         """urlfetch from fetchserver"""
@@ -993,28 +1019,12 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             return self.MOCK(502, {'Content-Type': 'text/html'}, content)
 
     def do_METHOD(self):
-        if self.command == 'CONNECT':
-            netloc = self.path
-        elif self.path[0] == '/':
-            netloc = self.headers.get('Host', 'localhost')
-            self.path = '%s://%s%s' % (self.scheme, netloc, self.path)
-        else:
-            netloc = urlparse.urlsplit(self.path).netloc
-        m = re.match(r'^(.+):(\d+)$', netloc)
-        if m:
-            self.host = m.group(1).strip('[]')
-            self.port = int(m.group(2))
-        else:
-            self.host = netloc
-            self.port = 443 if self.scheme == 'http' else 80
-        if self.has_auth_filter:
-            auth_headers = {k.title(): v for k, v in self.headers.items() if k.title().endswith('-Authorization')}
-            original_auth_headers = getattr(self, 'auth_headers', {})
-            if auth_headers or original_auth_headers:
-                for key, value in original_auth_headers.items():
-                    if key not in auth_headers:
-                        self.headers[key] = value
+        self.parse_header()
         self.body = self.rfile.read(int(self.headers['Content-Length'])) if 'Content-Length' in self.headers else ''
+        if self.stripssl_handler_filter:
+            action = self.stripssl_handler_filter.filter(self)
+            if action:
+                return action.pop(0)(*action)
         for handler_filter in self.handler_filters:
             action = handler_filter.filter(self)
             if action:
@@ -1192,6 +1202,7 @@ class AdvancedProxyHandler(SimpleProxyHandler):
     dns_servers = []
     dns_blacklist = []
     tcp_connection_time = collections.defaultdict(float)
+    tcp_connection_time_with_clienthello = collections.defaultdict(float)
     tcp_connection_cache = collections.defaultdict(Queue.PriorityQueue)
     ssl_connection_time = collections.defaultdict(float)
     ssl_connection_cache = collections.defaultdict(Queue.PriorityQueue)
@@ -1211,9 +1222,8 @@ class AdvancedProxyHandler(SimpleProxyHandler):
         return iplist
 
     def create_tcp_connection(self, hostname, port, timeout, **kwargs):
-        #cache_key = kwargs.get('cache_key')
-        cache_key = ''
         client_hello = kwargs.get('client_hello', None)
+        cache_key = kwargs.get('cache_key') if not client_hello else None
         def create_connection(ipaddr, timeout, queobj):
             sock = None
             try:
@@ -1240,7 +1250,9 @@ class AdvancedProxyHandler(SimpleProxyHandler):
                         peek_data = sock.recv(1, socket.MSG_PEEK)
                         if not peek_data:
                             logging.debug('create_tcp_connection %r with client_hello return NULL byte, continue %r', ipaddr, time.time()-start_time)
-                            raise socket.error('timed out')
+                            raise socket.timeout('timed out')
+                        # record TCP connection time with client hello
+                        self.tcp_connection_time_with_clienthello[ipaddr] = time.time() - start_time
                 # put tcp socket object to output queobj
                 queobj.put(sock)
             except (socket.error, OSError) as e:
@@ -1257,8 +1269,15 @@ class AdvancedProxyHandler(SimpleProxyHandler):
                 tcp_time_threshold = min(1, 1.3 * first_tcp_time)
                 if sock and not isinstance(sock, Exception):
                     ipaddr = sock.getpeername()
-                    if cache_key and self.tcp_connection_time[ipaddr] < tcp_time_threshold and not client_hello:
-                        self.tcp_connection_cache[cache_key].put((time.time(), sock))
+                    if cache_key and self.tcp_connection_time[ipaddr] < tcp_time_threshold:
+                        cache_queue = self.tcp_connection_cache[cache_key]
+                        if cache_queue.qsize() < 8:
+                            try:
+                                _, old_sock = cache_queue.get_nowait()
+                                old_sock.close()
+                            except Queue.Empty:
+                                pass
+                        cache_queue.put((time.time(), sock))
                     else:
                         sock.close()
         try:
@@ -1274,7 +1293,10 @@ class AdvancedProxyHandler(SimpleProxyHandler):
         sock = None
         for _ in range(kwargs.get('max_retry', 3)):
             window = min((self.max_window+1)//2, len(addresses))
-            addresses.sort(key=self.tcp_connection_time.__getitem__)
+            if client_hello:
+                addresses.sort(key=self.tcp_connection_time_with_clienthello.__getitem__)
+            else:
+                addresses.sort(key=self.tcp_connection_time.__getitem__)
             addrs = addresses[:window] + random.sample(addresses, window)
             queobj = gevent.queue.Queue() if gevent else Queue.Queue()
             for addr in addrs:
@@ -1282,8 +1304,7 @@ class AdvancedProxyHandler(SimpleProxyHandler):
             for i in range(len(addrs)):
                 sock = queobj.get()
                 if not isinstance(sock, Exception):
-                    # first_tcp_time = self.tcp_connection_time[sock.getpeername()]
-                    first_tcp_time = 0
+                    first_tcp_time = self.tcp_connection_time[sock.getpeername()] if not cache_key else 0
                     thread.start_new_thread(close_connection, (len(addrs)-i-1, queobj, first_tcp_time))
                     return sock
                 elif i == 0:
@@ -1408,7 +1429,14 @@ class AdvancedProxyHandler(SimpleProxyHandler):
                 ssl_time_threshold = min(1, 1.3 * first_ssl_time)
                 if sock and not isinstance(sock, Exception):
                     if cache_key and sock.ssl_time < ssl_time_threshold:
-                        self.ssl_connection_cache[cache_key].put((time.time(), sock))
+                        cache_queue = self.ssl_connection_cache[cache_key]
+                        if cache_queue.qsize() < 8:
+                            try:
+                                _, old_sock = cache_queue.get_nowait()
+                                old_sock.close()
+                            except Queue.Empty:
+                                pass
+                        cache_queue.put((time.time(), sock))
                     else:
                         sock.close()
         try:
@@ -1463,6 +1491,8 @@ class AdvancedProxyHandler(SimpleProxyHandler):
                 break
             except Exception as e:
                 logging.exception('create_http_request "%s %s" failed:%s', method, url, e)
+                if sock:
+                    sock.close()
                 if i == max_retry - 1:
                     raise
         request_data = ''
@@ -1497,6 +1527,7 @@ class AdvancedProxyHandler(SimpleProxyHandler):
                 sock.sendall(data)
         else:
             raise TypeError('create_http_request(body) must be a string or buffer, not %r' % type(body))
+        response = None
         try:
             while crlf_counter:
                 response = httplib.HTTPResponse(sock, buffering=False)
@@ -1506,6 +1537,12 @@ class AdvancedProxyHandler(SimpleProxyHandler):
                 crlf_counter -= 1
         except Exception as e:
             logging.exception('crlf skip read host=%r path=%r error: %r', headers.get('Host'), path, e)
+            if response:
+                if response.fp and response.fp._sock:
+                    response.fp._sock.close()
+                response.close()
+            if sock:
+                sock.close()
             return None
         response = httplib.HTTPResponse(sock, buffering=True)
         response.begin()
@@ -1546,7 +1583,7 @@ class Common(object):
         self.GAE_VALIDATE = self.CONFIG.getint('gae', 'validate')
         self.GAE_OBFUSCATE = self.CONFIG.getint('gae', 'obfuscate')
         self.GAE_OPTIONS = self.CONFIG.get('gae', 'options')
-        self.GAE_REGIONS = frozenset(x.upper() for x in self.CONFIG.get('gae', 'regions').split('|') if x.strip())
+        self.GAE_REGIONS = set(x.upper() for x in self.CONFIG.get('gae', 'regions').split('|') if x.strip())
 
         if self.GAE_PROFILE == 'auto':
             try:
@@ -1586,7 +1623,8 @@ class Common(object):
         self.PAC_PORT = self.CONFIG.getint('pac', 'port')
         self.PAC_FILE = self.CONFIG.get('pac', 'file').lstrip('/')
         self.PAC_GFWLIST = self.CONFIG.get('pac', 'gfwlist')
-        self.PAC_ADBLOCK = self.CONFIG.get('pac', 'adblock') if self.CONFIG.has_option('pac', 'adblock') else ''
+        self.PAC_ADBLOCK = self.CONFIG.get('pac', 'adblock')
+        self.PAC_ADMODE = self.CONFIG.getint('pac', 'admode')
         self.PAC_EXPIRED = self.CONFIG.getint('pac', 'expired')
 
         self.PHP_ENABLE = self.CONFIG.getint('php', 'enable')
@@ -1843,7 +1881,7 @@ class WithGAEFilter(BaseProxyHandlerFilter):
         if handler.host in common.HTTP_WITHGAE:
             logging.debug('WithGAEFilter metched %r %r', handler.path, handler.headers)
             if handler.command == 'CONNECT':
-                return [handler.STRIPSSL]
+                return [handler.STRIPSSL, self]
             kwargs = {}
             if common.GAE_PASSWORD:
                 kwargs['password'] = common.GAE_PASSWORD
@@ -1866,7 +1904,7 @@ class FakeHttpsFilter(BaseProxyHandlerFilter):
     """fake https filter"""
     def filter(self, handler):
         if handler.command == 'CONNECT' and handler.host in common.HTTP_FAKEHTTPS:
-            return [handler.STRIPSSL]
+            return [handler.STRIPSSL, None]
 
 
 class HostsFilter(BaseProxyHandlerFilter):
@@ -1983,7 +2021,7 @@ class GAEFetchFilter(BaseProxyHandlerFilter):
     """force https filter"""
     def filter(self, handler):
         if handler.command == 'CONNECT':
-            return [handler.STRIPSSL]
+            return [handler.STRIPSSL, self]
         else:
             kwargs = {}
             if common.GAE_PASSWORD:
@@ -2084,7 +2122,7 @@ class PHPFetchFilter(BaseProxyHandlerFilter):
     """force https filter"""
     def filter(self, handler):
         if handler.command == 'CONNECT':
-            return [handler.STRIPSSL]
+            return [handler.STRIPSSL, self]
         else:
             kwargs = {}
             if common.PHP_PASSWORD:
@@ -2190,53 +2228,23 @@ class GreenForwardMixin:
                 if not data:
                     break
                 dest.sendall(data)
+        except socket.timeout:
+            pass
         except NetWorkIOError as e:
-            if e.args[0] not in ('timed out', errno.ECONNABORTED, errno.ECONNRESET, errno.EBADF, errno.EPIPE, errno.ENOTCONN, errno.ETIMEDOUT):
+            if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET, errno.ENOTCONN, errno.EPIPE):
                 raise
+            if e.args[0] in (errno.EBADF,):
+                return
         finally:
             for sock in (dest, source):
                 try:
                     sock.close()
-                except:
+                except Exception:
                     pass
 
-    def FORWARD(self, hostname, port, timeout, kwargs={}):
+    def forward_socket(self, local, remote, timeout):
         """forward socket"""
-        do_ssl_handshake = kwargs.pop('do_ssl_handshake', False)
         bufsize = self.bufsize
-        local = self.connection
-        remote = None
-        self.send_response(200)
-        self.end_headers()
-        self.close_connection = 1
-        data = local.recv(1024)
-        if not data:
-            local.close()
-            return
-        data_is_clienthello = is_clienthello(data)
-        if data_is_clienthello:
-            kwargs['client_hello'] = data
-        max_retry = kwargs.get('max_retry', 3)
-        for i in xrange(max_retry):
-            try:
-                if do_ssl_handshake:
-                    remote = self.create_ssl_connection(hostname, port, timeout, **kwargs)
-                else:
-                    remote = self.create_tcp_connection(hostname, port, timeout, **kwargs)
-                if not data_is_clienthello and remote and not isinstance(remote, Exception):
-                    remote.sendall(data)
-                break
-            except Exception as e:
-                logging.exception('%s "FWD %s %s:%d %s" %r', self.address_string(), self.command, hostname, port, self.protocol_version, e)
-                if hasattr(remote, 'close'):
-                    remote.close()
-                if i == max_retry - 1:
-                    raise
-        logging.info('%s "FWD %s %s:%d %s" - -', self.address_string(), self.command, hostname, port, self.protocol_version)
-        if hasattr(remote, 'fileno'):
-            # reset timeout default to avoid long http upload failure, but it will delay timeout retry :(
-            remote.settimeout(None)
-        del kwargs
         thread.start_new_thread(GreenForwardMixin.io_copy, (remote.dup(), local.dup(), timeout, bufsize))
         GreenForwardMixin.io_copy(local, remote, timeout, bufsize)
 
@@ -2327,13 +2335,14 @@ class PacUtil(object):
             need_update = False
         try:
             if common.PAC_ADBLOCK:
+                admode = common.PAC_ADMODE
                 logging.info('try download %r to update_pacfile(%r)', common.PAC_ADBLOCK, filename)
                 adblock_content = opener.open(common.PAC_ADBLOCK).read()
                 logging.info('%r downloaded, try convert it with adblock2pac', common.PAC_ADBLOCK)
                 if 'gevent' in sys.modules and time.sleep is getattr(sys.modules['gevent'], 'sleep', None) and hasattr(gevent.get_hub(), 'threadpool'):
-                    jsrule = gevent.get_hub().threadpool.apply_e(Exception, PacUtil.adblock2pac, (adblock_content, 'FindProxyForURLByAdblock', blackhole, default))
+                    jsrule = gevent.get_hub().threadpool.apply_e(Exception, PacUtil.adblock2pac, (adblock_content, 'FindProxyForURLByAdblock', blackhole, default, admode))
                 else:
-                    jsrule = PacUtil.adblock2pac(adblock_content, 'FindProxyForURLByAdblock', blackhole, default)
+                    jsrule = PacUtil.adblock2pac(adblock_content, 'FindProxyForURLByAdblock', blackhole, default, admode)
                 content += '\r\n' + jsrule + '\r\n'
                 logging.info('%r downloaded and parsed', common.PAC_ADBLOCK)
             else:
@@ -2431,24 +2440,28 @@ class PacUtil(object):
                 else:
                     direct_domain_set.add(domain)
         proxy_domain_set = set(x.lstrip('.') for x in proxy_domain_set)
-        jsLines = ',\n'.join('%s"%s": 1' % (' '*indent, x) for x in proxy_domain_set)
+        autoproxy_host = ',\r\n'.join('%s"%s": 1' % (' '*indent, x) for x in proxy_domain_set)
         template = '''\
-                    var domainsFor%s = {
-                    %s
+                    var autoproxy_host = {
+                    %(autoproxy_host)s
                     };
-                    function %s(url, host) {
+                    function %(func_name)s(url, host) {
                         var lastPos;
                         do {
-                            if (domainsFor%s.hasOwnProperty(host)) {
-                                return 'PROXY %s';
+                            if (autoproxy_host.hasOwnProperty(host)) {
+                                return 'PROXY %(proxy)s';
                             }
                             lastPos = host.indexOf('.') + 1;
                             host = host.slice(lastPos);
                         } while (lastPos >= 1);
-                        return '%s';
+                        return '%(default)s';
                     }'''
         template = re.sub(r'(?m)^\s{%d}' % min(len(re.search(r' +', x).group()) for x in template.splitlines()), '', template)
-        return template % (func_name, jsLines, func_name, func_name, proxy, default)
+        template_args = {'autoproxy_host': autoproxy_host,
+                         'func_name': func_name,
+                         'proxy': proxy,
+                         'default': default}
+        return template % template_args
 
     @staticmethod
     def urlfilter2pac(content, func_name='FindProxyForURLByUrlfilter', proxy='127.0.0.1:1999', default='DIRECT', indent=4):
@@ -2474,10 +2487,10 @@ class PacUtil(object):
         return function
 
     @staticmethod
-    def adblock2pac(content, func_name='FindProxyForURLByAdblock', proxy='127.0.0.1:1999', default='DIRECT', indent=4):
+    def adblock2pac(content, func_name='FindProxyForURLByAdblock', proxy='127.0.0.1:1999', default='DIRECT', admode=1, indent=4):
         """adblock list to Pac, based on https://github.com/iamamac/autoproxy2pac"""
-        white_conditions = []
-        black_conditions = []
+        white_conditions = {'host': [], 'url.indexOf': [], 'shExpMatch': []}
+        black_conditions = {'host': [], 'url.indexOf': [], 'shExpMatch': []}
         for line in content.splitlines()[1:]:
             if not line or line.startswith('!') or '##' in line or '#@#' in line:
                 continue
@@ -2514,55 +2527,113 @@ class PacUtil(object):
                 if not use_postfix:
                     use_end = True
             line = line.replace('^', '*').strip('*')
+            conditions = black_conditions if use_proxy else white_conditions
             if use_start and use_end:
-                jsCondition = ['shExpMatch(url, "*%s*")' % line]
+                conditions['shExpMatch'] += ['*%s*' % line]
             elif use_start:
                 if '*' in line:
                     if use_postfix:
-                        jsCondition = ['shExpMatch(url, "*%s*%s")' % (line, x) for x in use_postfix]
+                        conditions['shExpMatch'] += ['*%s*%s' % (line, x) for x in use_postfix]
                     else:
-                        jsCondition = ['shExpMatch(url, "*%s*")' % line]
+                        conditions['shExpMatch'] += ['*%s*' % line]
                 else:
-                    jsCondition = ['url.indexOf("%s") >= 0' % line]
+                    conditions['url.indexOf'] += [line]
             elif use_domain and use_end:
                 if '*' in line:
-                    jsCondition = ['shExpMatch(host, "%s*")' % line]
+                    conditions['shExpMatch'] += ['%s*' % line]
                 else:
-                    jsCondition = ['host == "%s"' % line]
+                    conditions['host'] += [line]
             elif use_domain:
                 if line.split('/')[0].count('.') <= 1:
                     if use_postfix:
-                        jsCondition = ['shExpMatch(url, "*.%s*%s")' % (line, x) for x in use_postfix]
+                        conditions['shExpMatch'] += ['*.%s*%s' % (line, x) for x in use_postfix]
                     else:
-                        jsCondition = ['shExpMatch(url, "*.%s*")' % line]
+                        conditions['shExpMatch'] += ['*.%s*' % line]
                 else:
                     if '*' in line:
                         if use_postfix:
-                            jsCondition = ['shExpMatch(url, "*%s*%s")' % (line, x) for x in use_postfix]
+                            conditions['shExpMatch'] += ['*%s*%s' % (line, x) for x in use_postfix]
                         else:
-                            jsCondition = ['shExpMatch(url, "*%s*")' % line]
+                            conditions['shExpMatch'] += ['*%s*' % line]
                     else:
                         if use_postfix:
-                            jsCondition = ['shExpMatch(url, "*%s*%s")' % (line, x) for x in use_postfix]
+                            conditions['shExpMatch'] += ['*%s*%s' % (line, x) for x in use_postfix]
                         else:
-                            jsCondition = ['url.indexOf("http://%s") == 0' % line]
+                            conditions['url.indexOf'] += ['http://%s' % line]
             else:
                 if use_postfix:
-                    jsCondition = ['shExpMatch(url, "*%s*%s")' % (line, x) for x in use_postfix]
+                    conditions['shExpMatch'] += ['*%s*%s' % (line, x) for x in use_postfix]
                 else:
-                    jsCondition = ['shExpMatch(url, "*%s*")' % line]
-            if use_proxy:
-                black_conditions += jsCondition
-            else:
-                white_conditions += jsCondition
-        template = '''\
+                    conditions['shExpMatch'] += ['*%s*' % line]
+        templates = ['''\
+                    function %(func_name)s(url, host) {
+                        return '%(default)s';
+                    }''',
+                    '''\
+                    var blackhole_host = {
+                    %(blackhole_host)s
+                    };
+                    function %(func_name)s(url, host) {
+                        // untrusted ablock plus list, disable whitelist until chinalist come back.
+                        if (blackhole_host.hasOwnProperty(host)) {
+                            return 'PROXY %(proxy)s';
+                        }
+                        return '%(default)s';
+                    }''',
+                    '''\
+                    var blackhole_host = {
+                    %(blackhole_host)s
+                    };
+                    var blackhole_url_indexOf = [
+                    %(blackhole_url_indexOf)s
+                    ];
                     function %s(url, host) {
                         // untrusted ablock plus list, disable whitelist until chinalist come back.
-                    %s
-                        return "%s";
-                    }'''
-        template = re.sub(r'(?m)^\s{%d}' % min(len(re.search(r' +', x).group()) for x in template.splitlines()), '', template)
-        return template % (func_name, '\r\n'.join('%sif (%s) return "%s";' % (' '*indent, line, proxy) for line in black_conditions) , default)
+                        if (blackhole_host.hasOwnProperty(host)) {
+                            return 'PROXY %(proxy)s';
+                        }
+                        for (i = 0; i < blackhole_url_indexOf.length; i++) {
+                            if (url.indexOf(blackhole_url_indexOf[i]) >= 0) {
+                                return 'PROXY %(proxy)s';
+                            }
+                        }
+                        return '%(default)s';
+                    }''',
+                    '''\
+                    var blackhole_host = {
+                    %(blackhole_host)s
+                    };
+                    var blackhole_url_indexOf = [
+                    %(blackhole_url_indexOf)s
+                    ];
+                    var blackhole_shExpMatch = [
+                    %(blackhole_shExpMatch)s
+                    ];
+                    function %(func_name)s(url, host) {
+                        // untrusted ablock plus list, disable whitelist until chinalist come back.
+                        if (blackhole_host.hasOwnProperty(host)) {
+                            return 'PROXY %(proxy)s';
+                        }
+                        for (i = 0; i < blackhole_url_indexOf.length; i++) {
+                            if (url.indexOf(blackhole_url_indexOf[i]) >= 0) {
+                                return 'PROXY %(proxy)s';
+                            }
+                        }
+                        for (i = 0; i < blackhole_shExpMatch.length; i++) {
+                            if (shExpMatch(url, blackhole_shExpMatch[i])) {
+                                return 'PROXY %(proxy)s';
+                            }
+                        }
+                        return '%(default)s';
+                    }''']
+        template = re.sub(r'(?m)^\s{%d}' % min(len(re.search(r' +', x).group()) for x in templates[admode].splitlines()), '', templates[admode])
+        template_kwargs = {'blackhole_host': ',\r\n'.join("%s'%s': 1" % (' '*indent, x) for x in black_conditions['host']),
+                           'blackhole_url_indexOf': ',\r\n'.join("%s'%s'" % (' '*indent, x) for x in black_conditions['url.indexOf']),
+                           'blackhole_shExpMatch': ',\r\n'.join("%s'%s'" % (' '*indent, x) for x in black_conditions['shExpMatch']),
+                           'func_name': func_name,
+                           'proxy': proxy,
+                           'default': default}
+        return template % template_kwargs
 
 
 class PacFileFilter(BaseProxyHandlerFilter):
@@ -2579,17 +2650,19 @@ class PacFileFilter(BaseProxyHandlerFilter):
                 uptime = get_uptime()
                 if uptime and uptime > 1800:
                     thread.start_new_thread(lambda: os.utime(pacfile, (time.time(), time.time())) or PacUtil.update_pacfile(pacfile), tuple())
-                    if path.endswith('pac'):
-                        headers['Content-Type'] = 'text/plainplain'
-                    if 'gzip' in handler.headers.get('Accept-Encoding'):
-                        headers['Content-Encoding'] = 'gzip'
-                        compressobj = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL, 0)
-                        dataio = io.BytesIO()
-                        dataio.write('\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff')
-                        dataio.write(compressobj.compress(content))
-                        dataio.write(compressobj.flush())
-                        dataio.write(struct.pack('<LL', zlib.crc32(content) & 0xFFFFFFFFL, len(content) & 0xFFFFFFFFL))
-                        content = dataio.getvalue()
+            with open(pacfile, 'rb') as fp:
+                content = fp.read()
+                headers = {'Content-Type': 'text/plain'}
+                if 'gzip' in handler.headers.get('Accept-Encoding', ''):
+                    headers['Content-Encoding'] = 'gzip'
+                    compressobj = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL, 0)
+                    dataio = io.BytesIO()
+                    dataio.write('\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff')
+                    dataio.write(compressobj.compress(content))
+                    dataio.write(compressobj.flush())
+                    dataio.write(struct.pack('<LL', zlib.crc32(content) & 0xFFFFFFFFL, len(content) & 0xFFFFFFFFL))
+                    content = dataio.getvalue()
+                return [handler.MOCK, 200, headers, content]
 
 
 class StaticFileFilter(BaseProxyHandlerFilter):
@@ -2612,7 +2685,7 @@ class BlackholeFilter(BaseProxyHandlerFilter):
     def filter(self, handler):
         urlparts = urlparse.urlsplit(handler.path)
         if handler.command == 'CONNECT':
-            return [handler.STRIPSSL]
+            return [handler.STRIPSSL, self]
         elif handler.path.startswith(('http://', 'https://')):
             headers = {'Cache-Control': 'max-age=86400',
                        'Expires': 'Oct, 01 Aug 2100 00:00:00 GMT',
@@ -2743,10 +2816,8 @@ def pre_start():
     RangeFetch.maxsize = common.AUTORANGE_MAXSIZE
     RangeFetch.bufsize = common.AUTORANGE_BUFSIZE
     RangeFetch.waitsize = common.AUTORANGE_WAITSIZE
-    GAEProxyHandler.has_auth_filter = any(isinstance(x, AuthFilter) for x in GAEProxyHandler.handler_filters)
-    if common.LISTEN_USERNAME and common.LISTEN_PASSWORD and not GAEProxyHandler.has_auth_filter:
+    if common.LISTEN_USERNAME and common.LISTEN_PASSWORD:
         GAEProxyHandler.handler_filters.insert(0, AuthFilter(common.LISTEN_USERNAME, common.LISTEN_PASSWORD))
-        GAEProxyHandler.has_auth_filter = True
 
 class gfanqiang():      
     def updateappid(self):
