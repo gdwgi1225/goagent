@@ -647,7 +647,7 @@ class SimpleProxyHandlerFilter(BaseProxyHandlerFilter):
         if handler.command == 'CONNECT':
             return [handler.FORWARD, handler.host, handler.port, handler.connect_timeout]
         else:
-            return [handler.DIRECT]
+            return [handler.DIRECT, {}]
 
 
 class AuthFilter(BaseProxyHandlerFilter):
@@ -682,7 +682,7 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     """SimpleProxyHandler for GoAgent 3.x"""
 
     protocol_version = 'HTTP/1.1'
-    ssl_version = ssl.PROTOCOL_TLSv1
+    ssl_version = ssl.PROTOCOL_SSLv23
     scheme = 'http'
     skip_headers = frozenset(['Vary', 'Via', 'X-Forwarded-For', 'Proxy-Authorization', 'Proxy-Connection', 'Upgrade', 'X-Chrome-Variations', 'Connection', 'Cache-Control'])
     bufsize = 256 * 1024
@@ -974,7 +974,7 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             if response:
                 response.close()
 
-    def URLFETCH(self, fetchservers, max_retry=2, raw_response=False, kwargs={}):
+    def URLFETCH(self, fetchservers, max_retry=2, kwargs={}):
         """urlfetch from fetchserver"""
         method = self.command
         if self.path[0] == '/':
@@ -1016,45 +1016,26 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 content = message_html('502 URLFetch failed', 'Local URLFetch %r failed' % url, '<br>'.join(repr(x) for x in errors))
             return self.MOCK(status, headers, content)
         logging.info('%s "URL %s %s %s" %s %s', self.address_string(), method, url, self.protocol_version, response.status, response.getheader('Content-Length', '-'))
+        self.close_connection = True
         try:
             if response.status == 206:
                 return RangeFetch(self, response, fetchservers, **kwargs).fetch()
-            self.send_response(response.status)
-            for key, value in response.getheaders():
-                self.send_header(key, value)
-            self.end_headers()
-            if self.command == 'HEAD' or response.status in (204, 304) or response.getheader('Content-Length') == '0':
-                response.close()
-                return
-            content_length = int(response.getheader('Content-Length', 0))
-            content_range = response.getheader('Content-Range', '')
-            accept_ranges = response.getheader('Accept-Ranges', 'none')
-            need_chunked = response.getheader('Transfer-Encoding', '') and not raw_response
-            if content_range:
-                start, end = tuple(int(x) for x in re.search(r'bytes (\d+)-(\d+)/(\d+)', content_range).group(1, 2))
-            else:
-                start, end = 0, content_length-1
+            if response.app_type == 'gae':
+                self.send_response(response.status)
+                for key, value in response.getheaders():
+                    if key.title() == 'Transfer-Encoding':
+                        continue
+                    self.send_header(key, value)
+                self.end_headers()
+            bufsize = 8192
             while True:
-                data = response.read(8192)
+                data = response.read(bufsize)
+                if data:
+                    self.wfile.write(data)
                 if not data:
-                    if need_chunked:
-                        self.wfile.write('0\r\n\r\n')
                     response.close()
-                    return
-                start += len(data)
-                if need_chunked:
-                    self.wfile.write('%x\r\n' % len(data))
-                self.wfile.write(data)
-                if need_chunked:
-                    self.wfile.write('\r\n')
-                if need_chunked and len(data) < 8192:
-                    self.wfile.write('0\r\n\r\n')
-                    response.close()
-                    return
+                    break
                 del data
-                if start >= end and not raw_response:
-                    response.close()
-                    return
         except NetWorkIOError as e:
             if e[0] in (errno.ECONNABORTED, errno.EPIPE) or 'bad write retry' in repr(e):
                 return
@@ -1961,7 +1942,7 @@ class WithGAEFilter(BaseProxyHandlerFilter):
             if common.GAE_VALIDATE:
                 kwargs['validate'] = 1
             fetchservers = ['%s://%s.appspot.com%s' % (common.GAE_MODE, x, common.GAE_PATH) for x in common.GAE_APPIDS]
-            return [handler.URLFETCH, fetchservers, common.FETCHMAX_LOCAL, False, kwargs]
+            return [handler.URLFETCH, fetchservers, common.FETCHMAX_LOCAL, kwargs]
 
 
 class ForceHttpsFilter(BaseProxyHandlerFilter):
@@ -2022,6 +2003,8 @@ class HostsFilter(BaseProxyHandlerFilter):
             return None
         elif hostname in common.IPLIST_MAP:
             handler.dns_cache[host] = common.IPLIST_MAP[hostname]
+        elif re.match(r'^\d+\.\d+\.\d+\.\d+$', hostname) or ':' in hostname:
+            handler.dns_cache[host] = [hostname]
         elif hostname.startswith('file://'):
             filename = hostname.lstrip('file://')
             if os.name == 'nt':
@@ -2087,6 +2070,8 @@ class GAEFetchFilter(BaseProxyHandlerFilter):
     def filter(self, handler):
         if handler.command == 'CONNECT':
             return [handler.STRIPSSL, self if not common.URLRE_MAP else None]
+        elif handler.command == 'OPTIONS':
+            return [handler.DIRECT, {}]
         else:
             kwargs = {}
             if common.GAE_PASSWORD:
@@ -2094,7 +2079,7 @@ class GAEFetchFilter(BaseProxyHandlerFilter):
             if common.GAE_VALIDATE:
                 kwargs['validate'] = 1
             fetchservers = ['%s://%s.appspot.com%s' % (common.GAE_MODE, x, common.GAE_PATH) for x in common.GAE_APPIDS]
-            return [handler.URLFETCH, fetchservers, common.FETCHMAX_LOCAL, False, kwargs]
+            return [handler.URLFETCH, fetchservers, common.FETCHMAX_LOCAL, kwargs]
 
 
 class GAEProxyHandler(AdvancedProxyHandler):
@@ -2158,6 +2143,7 @@ class GAEProxyHandler(AdvancedProxyHandler):
         cache_key = '%s:%d' % (common.HOST_POSTFIX_MAP['.appspot.com'], 443 if common.GAE_MODE == 'https' else 80)
         response = self.create_http_request(request_method, fetchserver, request_headers, body, self.connect_timeout, crlf=need_crlf, validate=need_validate, cache_key=cache_key)
         response.app_status = response.status
+        response.app_type = 'gae'
         response.app_options = response.getheader('X-GOA-Options', '')
         if response.status != 200:
             return response
@@ -2200,7 +2186,7 @@ class PHPFetchFilter(BaseProxyHandlerFilter):
                 kwargs['password'] = common.PHP_PASSWORD
             if common.PHP_VALIDATE:
                 kwargs['validate'] = 1
-            return [handler.URLFETCH, [common.PHP_FETCHSERVER], 1, True, kwargs]
+            return [handler.URLFETCH, [common.PHP_FETCHSERVER], 1, kwargs]
 
 
 class PHPProxyHandler(AdvancedProxyHandler):
@@ -2249,6 +2235,7 @@ class PHPProxyHandler(AdvancedProxyHandler):
         if response.status >= 400:
             return response
         response.app_status = response.status
+        response.app_type = 'php'
         need_decrypt = kwargs.get('password') and response.app_status == 200 and response.getheader('Content-Type', '') == 'image/gif' and response.fp
         if need_decrypt:
             response.fp = CipherFileObject(response.fp, XORCipher(kwargs['password'][0]))
