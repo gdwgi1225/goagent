@@ -171,7 +171,8 @@ def application(environ, start_response):
 
     deadline = URLFETCH_TIMEOUT
     validate_certificate = bool(int(kwargs.get('validate', 0)))
-    accept_encoding = headers.get('Accept-Encoding', '')
+    # https://www.freebsdchina.org/forum/viewtopic.php?t=54269
+    accept_encoding = headers.get('Accept-Encoding', '') or headers.get('Bccept-Encoding', '')
     errors = []
     for i in xrange(int(kwargs.get('fetchmax', URLFETCH_MAX))):
         try:
@@ -223,7 +224,7 @@ def application(environ, start_response):
     data = response.content
     response_headers = response.headers
     content_type = response_headers.get('content-type', '')
-    if 'content-encoding' not in response_headers and 0 < len(response.content) < URLFETCH_DEFLATE_MAXSIZE and content_type.startswith(('text/', 'application/json', 'application/javascript')):
+    if 'content-encoding' not in response_headers and 512 < len(response.content) < URLFETCH_DEFLATE_MAXSIZE and content_type.startswith(('text/', 'application/json', 'application/javascript')):
         if 'gzip' in accept_encoding:
             response_headers['Content-Encoding'] = 'gzip'
             compressobj = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL, 0)
