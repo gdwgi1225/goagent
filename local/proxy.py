@@ -997,11 +997,11 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     break
                 else:
                     self.handle_urlfetch_error(fetchserver, response)
-                    if i < max_retry - 1:
-                        if len(fetchservers) > 1:
-                            fetchserver = random.choice(fetchservers[1:])
-                        logging.info('URLFETCH return %d, trying fetchserver=%r', response.app_status, fetchserver)
-                    response.close()
+                if i < max_retry - 1:
+                    if len(fetchservers) > 1:
+                        fetchserver = random.choice(fetchservers[1:])
+                    logging.info('URLFETCH return %d, trying fetchserver=%r', response.app_status, fetchserver)
+                response.close()
             except Exception as e:
                 errors.append(e)
                 logging.info('URLFETCH fetchserver=%r %r, retry...', fetchserver, e)
@@ -2170,13 +2170,15 @@ class GAEProxyHandler(AdvancedProxyHandler):
             if kwargs.get('password') and response.fp:
                 response.fp = CipherFileObject(response.fp, RC4Cipher(kwargs['password']))
         return response
-            # appid over qouta, switch to next appid
+
     def handle_urlfetch_error(self, fetchserver, response):
         gae_appid = urlparse.urlsplit(fetchserver).netloc.split('.')[-3]
         if response.app_status == 503:
+            # appid over qouta, switch to next appid
             if gae_appid == common.GAE_APPIDS[0] and len(common.GAE_APPIDS) > 1:
                 common.GAE_APPIDS.append(common.GAE_APPIDS.pop(0))
                 logging.info('gae_appid=%r over qouta, switch next appid=%r', gae_appid, common.GAE_APPIDS[0])
+
 
 class PHPFetchFilter(BaseProxyHandlerFilter):
     """force https filter"""
