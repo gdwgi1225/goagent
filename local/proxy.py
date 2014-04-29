@@ -853,21 +853,23 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
-    def STRIPSSL(self, sticky_filter=None):
-        """strip ssl"""
+    def STRIP(self, do_ssl_handshake=True, sticky_filter=None):
+        """strip connect"""
         certfile = CertUtil.get_cert(self.host)
-        logging.info('%s "SSL %s %s:%d %s" - -', self.address_string(), self.command, self.host, self.port, self.protocol_version)
+        logging.info('%s "STRIP %s %s:%d %s" - -', self.address_string(), self.command, self.host, self.port, self.protocol_version)
         self.send_response(200)
         self.end_headers()
-        try:
-            ssl_sock = ssl.wrap_socket(self.connection, ssl_version=self.ssl_version, keyfile=certfile, certfile=certfile, server_side=True)
-        except Exception as e:
-            if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET):
-                logging.exception('ssl.wrap_socket(self.connection=%r) failed: %s', self.connection, e)
-            return
-        self.connection = ssl_sock
-        self.rfile = self.connection.makefile('rb', self.bufsize)
-        self.wfile = self.connection.makefile('wb', 0)
+        if do_ssl_handshake:
+            try:
+                ssl_sock = ssl.wrap_socket(self.connection, ssl_version=self.ssl_version, keyfile=certfile, certfile=certfile, server_side=True)
+            except Exception as e:
+                if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET):
+                    logging.exception('ssl.wrap_socket(self.connection=%r) failed: %s', self.connection, e)
+                return
+            self.connection = ssl_sock
+            self.rfile = self.connection.makefile('rb', self.bufsize)
+            self.wfile = self.connection.makefile('wb', 0)
+            self.scheme = 'https'
         try:
             self.raw_requestline = self.rfile.readline(65537)
             if len(self.raw_requestline) > 65536:
@@ -884,7 +886,6 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         except NetWorkIOError as e:
             if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET, errno.EPIPE):
                 raise
-        self.scheme = 'https'
         self.sticky_filter = sticky_filter
         try:
             self.do_METHOD()
@@ -1952,7 +1953,7 @@ class FakeHttpsFilter(BaseProxyHandlerFilter):
     def filter(self, handler):
         if handler.command == 'CONNECT' and handler.host in common.HTTP_FAKEHTTPS:
             logging.debug('FakeHttpsFilter metched %r %r', handler.path, handler.headers)
-            return [handler.STRIPSSL, None]
+            return [handler.STRIP, True, None]
 
 
 class HostsFilter(BaseProxyHandlerFilter):
@@ -2008,8 +2009,11 @@ class HostsFilter(BaseProxyHandlerFilter):
         if handler.command == 'CONNECT':
             return [handler.FORWARD, host, port, handler.connect_timeout, {'cache_key': cache_key}]
         else:
-            crlf = host.endswith(common.HTTP_CRLFSITES)
-            return [handler.DIRECT, {'cache_key': cache_key, 'crlf': crlf}]
+            if host.endswith(common.HTTP_CRLFSITES):
+                handler.close_connection = True
+                return [handler.DIRECT, {'crlf': True}]
+            else:
+                return [handler.DIRECT, {'cache_key': cache_key}]
 
 
 class DirectRegionFilter(BaseProxyHandlerFilter):
@@ -2064,7 +2068,9 @@ class GAEFetchFilter(BaseProxyHandlerFilter):
     """force https filter"""
     def filter(self, handler):
         if handler.command == 'CONNECT':
-            return [handler.STRIPSSL, self if not common.URLRE_MAP else None]
+            # https://developers.google.com/appengine/docs/python/urlfetch/
+            do_ssl_handshake = 440 <= handler.port <= 450 or 1024 <= handler.port <= 65535
+            return [handler.STRIP, do_ssl_handshake, self if not common.URLRE_MAP else None]
         elif handler.command in ('OPTIONS',):
             # if common.PHP_ENABLE:
             #     return PHPProxyHandler.handler_filters[-1].filter(handler)
@@ -2176,7 +2182,7 @@ class PHPFetchFilter(BaseProxyHandlerFilter):
     """force https filter"""
     def filter(self, handler):
         if handler.command == 'CONNECT':
-            return [handler.STRIPSSL, self]
+            return [handler.STRIP, True, self]
         else:
             kwargs = {}
             if common.PHP_PASSWORD:
@@ -2739,7 +2745,7 @@ class BlackholeFilter(BaseProxyHandlerFilter):
 
     def filter(self, handler):
         if handler.command == 'CONNECT':
-            return [handler.STRIPSSL, self]
+            return [handler.STRIP, True, self]
         elif handler.path.startswith(('http://', 'https://')):
             headers = {'Cache-Control': 'max-age=86400',
                        'Expires': 'Oct, 01 Aug 2100 00:00:00 GMT',
