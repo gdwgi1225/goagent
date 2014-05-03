@@ -2439,7 +2439,7 @@ class PacUtil(object):
 
     @staticmethod
     def update_pacfile(filename):
-        listen_ip = ProxyUtil.get_listen_ip() if common.LISTEN_IP in ('', '::', '0.0.0.0') else common.LISTEN_IP
+        listen_ip = '127.0.0.1'
         autoproxy = '%s:%s' % (listen_ip, common.LISTEN_PORT)
         blackhole = '%s:%s' % (listen_ip, common.PAC_PORT)
         default = 'PROXY %s:%s' % (common.PROXY_HOST, common.PROXY_PORT) if common.PROXY_ENABLE else 'DIRECT'
@@ -2767,11 +2767,15 @@ class PacFileFilter(BaseProxyHandlerFilter):
     """pac file filter"""
 
     def filter(self, handler):
+        is_local_client = handler.client_address[0] in ('127.0.0.1', '::1')
         pacfile = os.path.join(os.path.dirname(os.path.abspath(__file__)), common.PAC_FILE)
         urlparts = urlparse.urlsplit(handler.path)
         if handler.command == 'GET' and urlparts.path.lstrip('/') == common.PAC_FILE:
             if urlparts.query == 'flush':
-                thread.start_new_thread(PacUtil.update_pacfile, (pacfile,))
+                if is_local_client:
+                    thread.start_new_thread(PacUtil.update_pacfile, (pacfile,))
+                else:
+                    return [handler.MOCK, 403, {'Content-Type': 'text/plain'}, 'client address %r not allowed' % handler.client_address[0]]
             if time.time() - os.path.getmtime(pacfile) > common.PAC_EXPIRED:
                 # check system uptime > 30 minutes
                 uptime = get_uptime()
@@ -2779,6 +2783,9 @@ class PacFileFilter(BaseProxyHandlerFilter):
                     thread.start_new_thread(lambda: os.utime(pacfile, (time.time(), time.time())) or PacUtil.update_pacfile(pacfile), tuple())
             with open(pacfile, 'rb') as fp:
                 content = fp.read()
+                if not is_local_client:
+                    listen_ip = ProxyUtil.get_listen_ip()
+                    content = content.replace('127.0.0.1', listen_ip)
                 headers = {'Content-Type': 'text/plain'}
                 if 'gzip' in handler.headers.get('Accept-Encoding', ''):
                     headers['Content-Encoding'] = 'gzip'
