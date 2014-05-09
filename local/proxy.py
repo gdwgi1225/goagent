@@ -348,7 +348,7 @@ class CertUtil(object):
                     x509 = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, fp.read())
                     commonname = next(v.decode() for k, v in x509.get_subject().get_components() if k == b'O')
                     sha1digest = x509.digest('sha1')
-            except Exception as e:
+            except StandardError as e:
                 logging.error('load_certificate(certfile=%r) failed:%s', certfile, e)
         if sys.platform.startswith('win'):
             import ctypes
@@ -551,10 +551,15 @@ class ProxyUtil(object):
 
     @staticmethod
     def get_listen_ip():
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.connect(('8.8.8.8', 53))
-        listen_ip = sock.getsockname()[0]
-        sock.close()
+        listen_ip = '127.0.0.1'
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.connect(('8.8.8.8', 53))
+            listen_ip = sock.getsockname()[0]
+        finally:
+            if sock:
+                sock.close()
         return listen_ip
 
 
@@ -813,7 +818,7 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     if isinstance(self.__class__.first_run, collections.Callable):
                         self.first_run()
                         self.__class__.first_run = None
-            except Exception as e:
+            except StandardError as e:
                 logging.exception('%s.first_run() return %r', self.__class__, e)
         self.__class__.setup = BaseHTTPServer.BaseHTTPRequestHandler.setup
         self.__class__.do_CONNECT = self.__class__.do_METHOD
@@ -829,7 +834,7 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         if not self.disable_transport_ssl and self.scheme == 'http':
             leadbyte = self.connection.recv(1, socket.MSG_PEEK)
             if leadbyte in ('\x80', '\x16'):
-                server_name = 'www.google.com'
+                server_name = ''
                 if leadbyte == '\x16':
                     for _ in xrange(2):
                         leaddata = self.connection.recv(1024, socket.MSG_PEEK)
@@ -841,7 +846,7 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 try:
                     certfile = CertUtil.get_cert(server_name or 'www.google.com')
                     ssl_sock = ssl.wrap_socket(self.connection, ssl_version=self.ssl_version, keyfile=certfile, certfile=certfile, server_side=True)
-                except Exception as e:
+                except StandardError as e:
                     if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET):
                         logging.exception('ssl.wrap_socket(self.connection=%r) failed: %s', self.connection, e)
                     return
@@ -849,7 +854,6 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self.rfile = self.connection.makefile('rb', self.bufsize)
                 self.wfile = self.connection.makefile('wb', 0)
                 self.scheme = 'https'
-
         return BaseHTTPServer.BaseHTTPRequestHandler.handle_one_request(self)
 
     def first_run(self):
@@ -942,7 +946,7 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             for sock in (remote, local):
                 try:
                     sock.close()
-                except Exception:
+                except StandardError:
                     pass
 
     def MOCK(self, status, headers, content):
@@ -970,7 +974,7 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         if do_ssl_handshake:
             try:
                 ssl_sock = ssl.wrap_socket(self.connection, ssl_version=self.ssl_version, keyfile=certfile, certfile=certfile, server_side=True)
-            except Exception as e:
+            except StandardError as e:
                 if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET):
                     logging.exception('ssl.wrap_socket(self.connection=%r) failed: %s', self.connection, e)
                 return
@@ -1026,7 +1030,7 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 if not data_is_clienthello and remote and not isinstance(remote, Exception):
                     remote.sendall(data)
                 break
-            except Exception as e:
+            except StandardError as e:
                 logging.exception('%s "FWD %s %s:%d %s" %r', self.address_string(), self.command, hostname, port, self.protocol_version, e)
                 if hasattr(remote, 'close'):
                     remote.close()
@@ -1096,11 +1100,10 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         body = self.body
         response = None
         errors = []
-        headers_sent = False
         fetchserver = fetchservers[0]
         for i in xrange(max_retry):
             try:
-                response = self.create_http_request_withserver(fetchserver, method, url, headers, body, timeout=self.connect_timeout, **kwargs)
+                response = self.create_http_request_withserver(fetchserver, method, url, headers, body, timeout=60, **kwargs)
                 if response.app_status < 400:
                     break
                 else:
@@ -1109,10 +1112,10 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     if len(fetchservers) > 1:
                         fetchserver = random.choice(fetchservers[1:])
                     logging.info('URLFETCH return %d, trying fetchserver=%r', response.app_status, fetchserver)
-                response.close()
-            except Exception as e:
+                    response.close()
+            except StandardError as e:
                 errors.append(e)
-                logging.info('URLFETCH fetchserver=%r %r, retry...', fetchserver, e)
+                logging.info('URLFETCH "%s %s" fetchserver=%r %r, retry...', method, url, fetchserver, e)
         if len(errors) == max_retry:
             if response and response.app_status >= 500:
                 status = response.app_status
@@ -1241,7 +1244,7 @@ class RangeFetch(object):
                 self.handler.wfile.write(data)
                 self.expect_begin += len(data)
                 del data
-            except Exception as e:
+            except StandardError as e:
                 logging.info('RangeFetch client connection aborted(%s).', e)
                 break
         self._stopped = True
@@ -1268,7 +1271,7 @@ class RangeFetch(object):
                         response = self.handler.create_http_request_withserver(fetchserver, self.handler.command, self.url, headers, self.handler.body, timeout=self.handler.connect_timeout, **self.kwargs)
                 except Queue.Empty:
                     continue
-                except Exception as e:
+                except StandardError as e:
                     logging.warning("Response %r in __fetchlet", e)
                     range_queue.put((start, end, None))
                     continue
@@ -1308,7 +1311,7 @@ class RangeFetch(object):
                                 break
                             data_queue.put((start, data))
                             start += len(data)
-                        except Exception as e:
+                        except StandardError as e:
                             logging.warning('RangeFetch "%s %s" %s failed: %s', self.handler.command, self.url, headers['Range'], e)
                             break
                     if start < end + 1:
@@ -1322,7 +1325,7 @@ class RangeFetch(object):
                     response.close()
                     range_queue.put((start, end, None))
                     continue
-            except Exception as e:
+            except StandardError as e:
                 logging.exception('RangeFetch._fetchlet error:%s', e)
                 raise
 
@@ -1623,7 +1626,7 @@ class AdvancedProxyHandler(SimpleProxyHandler):
                 create_connection = self.create_ssl_connection if scheme == 'https' else self.create_tcp_connection
                 sock = create_connection(host, port, timeout, validate=validate, cache_key=cache_key)
                 break
-            except Exception as e:
+            except StandardError as e:
                 logging.exception('create_http_request "%s %s" failed:%s', method, url, e)
                 if sock:
                     sock.close()
@@ -1669,7 +1672,7 @@ class AdvancedProxyHandler(SimpleProxyHandler):
                 response.read()
                 response.close()
                 crlf_counter -= 1
-        except Exception as e:
+        except StandardError as e:
             logging.exception('crlf skip read host=%r path=%r error: %r', headers.get('Host'), path, e)
             if response:
                 if response.fp and response.fp._sock:
@@ -2015,7 +2018,7 @@ class LocalProxyServer(SocketServer.ThreadingTCPServer):
     def close_request(self, request):
         try:
             request.close()
-        except Exception:
+        except StandardError:
             pass
 
     def finish_request(self, request, client_address):
@@ -2076,7 +2079,7 @@ class HostsFilter(BaseProxyHandlerFilter):
         try:
             import mimetypes
             content_type = mimetypes.types_map.get(os.path.splitext(filename)[1])
-        except Exception as e:
+        except StandardError as e:
             logging.error('import mimetypes failed: %r', e)
         try:
             with open(filename, 'rb') as fp:
@@ -2085,7 +2088,7 @@ class HostsFilter(BaseProxyHandlerFilter):
                 if content_type:
                     headers['Content-Type'] = content_type
                 return [handler.MOCK, 200, headers, data]
-        except Exception as e:
+        except StandardError as e:
             return [handler.MOCK, 403, {'Connection': 'close'}, 'read %r %r' % (filename, e)]
 
     def filter(self, handler):
@@ -2114,10 +2117,10 @@ class HostsFilter(BaseProxyHandlerFilter):
         elif hostname == host and host.endswith(common.DNS_TCPOVER) and host not in handler.dns_cache:
             try:
                 iplist = dns_resolve_over_tcp(host, handler.dns_servers, handler.dns_blacklist, 4)
-                logging.info('TcpoverDnsFilter resolve %r with %r return %s', host, handler.dns_servers, iplist)
+                logging.info('HostsFilter dns_resolve_over_tcp %r with %r return %s', host, handler.dns_servers, iplist)
                 handler.dns_cache[host] = iplist
             except socket.error as e:
-                logging.warning('TcpoverDnsFilter resolve %r with %r failed: %r', host, handler.dns_servers, e)
+                logging.warning('HostsFilter dns_resolve_over_tcp %r with %r failed: %r', host, handler.dns_servers, e)
         elif re.match(r'^\d+\.\d+\.\d+\.\d+$', hostname) or ':' in hostname:
             handler.dns_cache[host] = [hostname]
         elif hostname.startswith('file://'):
@@ -2141,15 +2144,21 @@ class DirectRegionFilter(BaseProxyHandlerFilter):
     geoip = pygeoip.GeoIP(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'GeoIP.dat')) if pygeoip and common.GAE_REGIONS else None
     region_cache = LRUCache(16*1024)
 
-    def get_country_code(self, hostname):
+    def get_country_code(self, hostname, dnsservers):
         """http://dev.maxmind.com/geoip/legacy/codes/iso3166/"""
         try:
             return self.region_cache[hostname]
         except KeyError:
             pass
         try:
-            country_code = self.geoip.country_code_by_addr(socket.gethostbyname(hostname))
-        except Exception as e:
+            if re.match(r'^\d+\.\d+\.\d+\.\d+$', hostname) or ':' in hostname:
+                iplist = [hostname]
+            elif dnsservers:
+                iplist = dns_resolve_over_udp(hostname, dnsservers, [], 2)
+            else:
+                iplist = socket.gethostbyname_ex(hostname)[-1]
+            country_code = self.geoip.country_code_by_addr(iplist[0])
+        except StandardError as e:
             logging.warning('DirectRegionFilter cannot determine region for hostname=%r %r', hostname, e)
             country_code = ''
         self.region_cache[hostname] = country_code
@@ -2157,7 +2166,7 @@ class DirectRegionFilter(BaseProxyHandlerFilter):
 
     def filter(self, handler):
         if self.geoip:
-            country_code = self.get_country_code(handler.host)
+            country_code = self.get_country_code(handler.host, handler.dns_servers)
             if country_code in common.GAE_REGIONS:
                 if handler.command == 'CONNECT':
                     return [handler.FORWARD, handler.host, handler.port, handler.connect_timeout]
@@ -2264,7 +2273,7 @@ class GAEProxyHandler(AdvancedProxyHandler):
         need_crlf = 0 if common.GAE_MODE == 'https' else 1
         need_validate = common.GAE_VALIDATE
         cache_key = '%s:%d' % (common.HOST_POSTFIX_MAP['.appspot.com'], 443 if common.GAE_MODE == 'https' else 80)
-        response = self.create_http_request(request_method, fetchserver, request_headers, body, self.connect_timeout, crlf=need_crlf, validate=need_validate, cache_key=cache_key)
+        response = self.create_http_request(request_method, fetchserver, request_headers, body, timeout, crlf=need_crlf, validate=need_validate, cache_key=cache_key)
         response.app_status = response.status
         response.app_type = 'gae'
         response.app_options = response.getheader('X-GOA-Options', '')
@@ -2354,7 +2363,7 @@ class PHPProxyHandler(AdvancedProxyHandler):
         fetchserver += '?%s' % random.random()
         crlf = 0
         cache_key = '%s//:%s' % urlparse.urlsplit(fetchserver)[:2]
-        response = self.create_http_request('POST', fetchserver, app_headers, app_body, self.connect_timeout, crlf=crlf, cache_key=cache_key)
+        response = self.create_http_request('POST', fetchserver, app_headers, app_body, timeout, crlf=crlf, cache_key=cache_key)
         if not response:
             raise socket.error(errno.ECONNRESET, 'urlfetch %r return None' % url)
         if response.status >= 400:
@@ -2380,7 +2389,7 @@ class ProxyChainMixin:
     def create_tcp_connection(self, hostname, port, timeout, **kwargs):
         sock = socket.create_connection((common.PROXY_HOST, int(common.PROXY_PORT)))
         if hostname.endswith('.appspot.com'):
-            hostname = ''
+            hostname = 'www.google.com'
         request_data = 'CONNECT %s:%s HTTP/1.1\r\n' % (hostname, port)
         if common.PROXY_USERNAME and common.PROXY_PASSWROD:
             request_data += 'Proxy-Authorization: Basic %s\r\n' % base64.b64encode(('%s:%s' % (common.PROXY_USERNAME, common.PROXY_PASSWROD)).encode()).decode().strip()
@@ -2422,7 +2431,7 @@ class GreenForwardMixin:
             for sock in (dest, source):
                 try:
                     sock.close()
-                except Exception:
+                except StandardError:
                     pass
 
     def forward_socket(self, local, remote, timeout):
@@ -2530,7 +2539,7 @@ class PacUtil(object):
                 logging.info('%r downloaded and parsed', common.PAC_ADBLOCK)
             else:
                 content += '\r\nfunction FindProxyForURLByAdblock(url, host) {return "DIRECT";}\r\n'
-        except Exception as e:
+        except StandardError as e:
             need_update = False
             logging.exception('update_pacfile failed: %r', e)
         try:
@@ -2543,7 +2552,7 @@ class PacUtil(object):
                 jsrule = PacUtil.autoproxy2pac_lite(autoproxy_content, 'FindProxyForURLByAutoProxy', autoproxy, default)
             content += '\r\n' + jsrule + '\r\n'
             logging.info('%r downloaded and parsed', common.PAC_GFWLIST)
-        except Exception as e:
+        except StandardError as e:
             need_update = False
             logging.exception('update_pacfile failed: %r', e)
         if need_update:
@@ -2622,8 +2631,8 @@ class PacUtil(object):
                     proxy_domain_set.add(domain)
                 else:
                     direct_domain_set.add(domain)
-        proxy_domain_set = set(x.lstrip('.') for x in proxy_domain_set)
-        autoproxy_host = ',\r\n'.join('%s"%s": 1' % (' '*indent, x) for x in proxy_domain_set)
+        proxy_domain_list = sorted(set(x.lstrip('.') for x in proxy_domain_set))
+        autoproxy_host = ',\r\n'.join('%s"%s": 1' % (' '*indent, x) for x in proxy_domain_list)
         template = '''\
                     var autoproxy_host = {
                     %(autoproxy_host)s
@@ -2810,9 +2819,9 @@ class PacUtil(object):
                         return '%(default)s';
                     }''']
         template = re.sub(r'(?m)^\s{%d}' % min(len(re.search(r' +', x).group()) for x in templates[admode].splitlines()), '', templates[admode])
-        template_kwargs = {'blackhole_host': ',\r\n'.join("%s'%s': 1" % (' '*indent, x) for x in black_conditions['host']),
-                           'blackhole_url_indexOf': ',\r\n'.join("%s'%s'" % (' '*indent, x) for x in black_conditions['url.indexOf']),
-                           'blackhole_shExpMatch': ',\r\n'.join("%s'%s'" % (' '*indent, x) for x in black_conditions['shExpMatch']),
+        template_kwargs = {'blackhole_host': ',\r\n'.join("%s'%s': 1" % (' '*indent, x) for x in sorted(black_conditions['host'])),
+                           'blackhole_url_indexOf': ',\r\n'.join("%s'%s'" % (' '*indent, x) for x in sorted(black_conditions['url.indexOf'])),
+                           'blackhole_shExpMatch': ',\r\n'.join("%s'%s'" % (' '*indent, x) for x in sorted(black_conditions['shExpMatch'])),
                            'func_name': func_name,
                            'proxy': proxy,
                            'default': default}
@@ -2935,7 +2944,7 @@ def get_process_list():
         try:
             import psutil
             process_list = psutil.get_process_list()
-        except Exception as e:
+        except StandardError as e:
             logging.exception('psutil.get_process_list() failed: %r', e)
     return process_list
 
@@ -3055,7 +3064,7 @@ def main():
             sys.path += ['.']
             from dnsproxy import DNSServer
             host, port = common.DNS_LISTEN.split(':')
-            server = DNSServer((host, int(port)), dns_servers=common.DNS_SERVERS, dns_blacklist=common.DNS_BLACKLIST)
+            server = DNSServer((host, int(port)), dns_servers=common.DNS_SERVERS, dns_blacklist=common.DNS_BLACKLIST, dns_tcpover=common.DNS_TCPOVER)
             thread.start_new_thread(server.serve_forever, tuple())
         except ImportError:
             logging.exception('GoAgent DNSServer requires dnslib and gevent 1.0')
