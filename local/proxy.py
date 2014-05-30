@@ -41,7 +41,7 @@
 #      v3aqb             <sgzz.cj@gmail.com>
 #      Oling Cat         <olingcat@gmail.com>
 
-__version__ = '3.1.13'
+__version__ = '3.1.14'
 
 import sys
 import os
@@ -577,7 +577,6 @@ def dnslib_resolve_over_udp(query, dnsservers, timeout, **kwargs):
     """
     if not isinstance(query, (basestring, dnslib.DNSRecord)):
         raise TypeError('query argument requires string/DNSRecord')
-    turstservers = kwargs.get('turstservers', ())
     if isinstance(query, basestring):
         query = dnslib.DNSRecord(q=dnslib.DNSQuestion(query))
     blacklist = kwargs.get('blacklist', ())
@@ -1535,7 +1534,7 @@ class AdvancedProxyHandler(SimpleProxyHandler):
                 if client_hello:
                     sock.sendall(client_hello)
                     if gevent and isinstance(sock, gevent.socket.socket):
-                         sock.data = data = sock.recv(4096)
+                        sock.data = data = sock.recv(4096)
                     else:
                         data = sock.recv(4096, socket.MSG_PEEK)
                     if not data:
@@ -2002,13 +2001,13 @@ class Common(object):
 
     def resolve_iplist(self):
         def do_resolve(host, dnsservers, queue):
-           iplist = []
-           for dnslib_resolve in (dnslib_resolve_over_udp, dnslib_resolve_over_tcp):
+            iplist = []
+            for dnslib_resolve in (dnslib_resolve_over_udp, dnslib_resolve_over_tcp):
                 try:
-                    iplist += dnslib_record2iplist(dnslib_resolve_over_udp(host, dnsservers, timeout=2, blacklist=self.DNS_BLACKLIST))
+                    iplist += dnslib_record2iplist(dnslib_resolve_over_udp(host, dnsservers, timeout=4, blacklist=self.DNS_BLACKLIST))
                 except (socket.error, OSError) as e:
                     logging.warning('%r remote host=%r failed: %s', dnslib_resolve, host, e)
-           queue.put((host, dnsservers, iplist))
+            queue.put((host, dnsservers, iplist))
         # https://support.google.com/websearch/answer/186669?hl=zh-Hans
         google_blacklist = ['216.239.32.20'] + list(self.DNS_BLACKLIST)
         for name, need_resolve_hosts in list(self.IPLIST_MAP.items()):
@@ -2023,14 +2022,14 @@ class Common(object):
                     thread.start_new_thread(do_resolve, (host, [dnsserver], result_queue))
             for _ in xrange(len(self.DNS_SERVERS) * len(need_resolve_remote)):
                 try:
-                    host, dnsservers, iplist = result_queue.get(timeout=5)
+                    host, dnsservers, iplist = result_queue.get(timeout=10)
                     resolved_iplist += iplist or []
                     logging.debug('resolve remote host=%r from dnsservers=%s return iplist=%s', host, dnsservers, iplist)
                 except Queue.Empty:
                     logging.warn('resolve remote timeout, try resolve local')
                     resolved_iplist += sum([socket.gethostbyname_ex(x)[-1] for x in need_resolve_remote], [])
                     break
-            if name.startswith('google_') and name not in ('google_cn', 'google_hk'):
+            if name.startswith('google_') and name not in ('google_cn', 'google_hk') and resolved_iplist:
                 iplist_prefix = re.split(r'[\.:]', resolved_iplist[0])[0]
                 resolved_iplist = list(set(x for x in resolved_iplist if x.startswith(iplist_prefix)))
             else:
@@ -2042,7 +2041,6 @@ class Common(object):
                 sys.exit(-1)
             logging.info('resolve name=%s host to iplist=%r', name, resolved_iplist)
             common.IPLIST_MAP[name] = resolved_iplist
-
 
     def info(self):
         info = ''
@@ -2059,6 +2057,7 @@ class Common(object):
         info += 'GAE Obfuscate      : %s\n' % self.GAE_OBFUSCATE if self.GAE_OBFUSCATE else ''
         if common.PAC_ENABLE:
             info += 'Pac Server         : http://%s:%d/%s\n' % (self.PAC_IP if self.PAC_IP and self.PAC_IP != '0.0.0.0' else ProxyUtil.get_listen_ip(), self.PAC_PORT, self.PAC_FILE)
+            info += 'Pac File           : file://%s\n' % os.path.abspath(self.PAC_FILE)
         if common.PHP_ENABLE:
             info += 'PHP Listen         : %s\n' % common.PHP_LISTEN
             info += 'PHP FetchServer    : %s\n' % common.PHP_FETCHSERVER
@@ -2089,7 +2088,7 @@ def message_html(title, banner, detail=''):
     </head>
     <body text=#000000 bgcolor=#ffffff>
     <table border=0 cellpadding=2 cellspacing=0 width=100%>
-     <tr><td bgcolor=#3366cc><font face=arial,sans-serif color=#ffffff><b>Message From LocalProxy</b></td></tr>
+    <tr><td bgcolor=#3366cc><font face=arial,sans-serif color=#ffffff><b>Message From LocalProxy</b></td></tr>
     <tr><td> </td></tr></table>
     <blockquote>
     <H1>$banner</H1>
@@ -2967,7 +2966,7 @@ class StaticFileFilter(BaseProxyHandlerFilter):
         <hr>
         <ul>
         $html
-        <ul>
+        </ul>
         <hr>
         </body></html>
         '''
@@ -3112,7 +3111,7 @@ def pre_start():
         with open('/proc/cpuinfo', 'rb') as fp:
             m = re.search(r'(?im)(BogoMIPS|cpu MHz)\s+:\s+([\d\.]+)', fp.read())
             if m and float(m.group(2)) < 1000:
-                logging.warning("*NOTE*, Please set [gae]window=2")
+                logging.warning("*NOTE*, Please set [gae]window=2 [gae]keepalive=1")
     if GAEProxyHandler.max_window != common.GAE_WINDOW:
         GAEProxyHandler.max_window = common.GAE_WINDOW
     if common.GAE_KEEPALIVE and common.GAE_MODE == 'https':
