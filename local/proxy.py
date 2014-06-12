@@ -41,7 +41,7 @@
 #      v3aqb             <sgzz.cj@gmail.com>
 #      Oling Cat         <olingcat@gmail.com>
 
-__version__ = '3.1.16'
+__version__ = '3.1.18'
 
 import sys
 import os
@@ -80,8 +80,8 @@ import random
 import base64
 import string
 import hashlib
-import threading
 import uuid
+import threading
 import thread
 import socket
 import ssl
@@ -703,9 +703,19 @@ def get_dnsserver_list():
 
 def spawn_later(seconds, target, *args, **kwargs):
     def wrap(*args, **kwargs):
-        __import__('time').sleep(seconds)
+        time.sleep(seconds)
         return target(*args, **kwargs)
-    return __import__('thread').start_new_thread(wrap, args, kwargs)
+    return thread.start_new_thread(wrap, args, kwargs)
+
+
+def spawn_period(seconds, target, *args, **kwargs):
+    def wrap(*args, **kwargs):
+        try:
+            time.sleep(seconds)
+            target(*args, **kwargs)
+        except StandardError as e:
+            logging.warning('%r(%s, %s) error: %r', target, args, kwargs, e)
+    return thread.start_new_thread(wrap, args, kwargs)
 
 
 def is_clienthello(data):
@@ -720,6 +730,10 @@ def is_clienthello(data):
         return len(data) == 2 + ord(data[1])
     else:
         return False
+
+
+def is_google_ip(ipaddr):
+    return ipaddr.startswith(('173.194.', '207.126.', '209.85.', '216.239.', '64.18.', '64.233.', '66.102.', '66.249.', '72.14.', '74.125.'))
 
 
 def extract_sni_name(packet):
@@ -783,9 +797,11 @@ class URLFetch(object):
         request_headers = {}
         if common.GAE_OBFUSCATE:
             request_method = 'GET'
-            ps_header = base64.b64encode(deflate(metadata + '\n' + (body or ''))).strip()
-            request_headers['X-GOA-PS'] = ps_header
             request_fetchserver += '/ps/%s.gif' % uuid.uuid1()
+            request_headers['X-GOA-PS1'] = base64.b64encode(deflate(metadata)).strip()
+            if body:
+                request_headers['X-GOA-PS2'] = base64.b64encode(deflate(body)).strip()
+                body = ''
             if common.GAE_PAGESPEED:
                 request_fetchserver = re.sub(r'^(\w+://)', r'\g<1>1-ps.googleusercontent.com/h/', request_fetchserver)
         else:
@@ -1780,17 +1796,21 @@ class AdvancedProxyHandler(SimpleProxyHandler):
             pass
         addresses = [(x, port) for x in self.gethostbyname2(hostname)]
         sock = None
-        for i in range(kwargs.get('max_retry', 3)):
+        for i in range(kwargs.get('max_retry', 5)):
             reorg_ipaddrs()
             window = self.max_window + i
             good_ipaddrs = [x for x in addresses if x in self.ssl_connection_good_ipaddrs]
-            good_ipaddrs = sorted(good_ipaddrs, key=self.ssl_connection_time.get)[:2*window]
+            good_ipaddrs = sorted(good_ipaddrs, key=self.ssl_connection_time.get)[:window]
             unkown_ipaddrs = [x for x in addresses if x not in self.ssl_connection_good_ipaddrs and x not in self.ssl_connection_bad_ipaddrs]
             random.shuffle(unkown_ipaddrs)
-            unkown_ipaddrs = unkown_ipaddrs[:max(window, 2*window-len(good_ipaddrs))]
+            unkown_ipaddrs = unkown_ipaddrs[:window]
             bad_ipaddrs = [x for x in addresses if x in self.ssl_connection_bad_ipaddrs]
-            bad_ipaddrs = sorted(bad_ipaddrs, key=self.ssl_connection_bad_ipaddrs.get)[:max(window, 3*window-len(good_ipaddrs)-len(unkown_ipaddrs))]
+            bad_ipaddrs = sorted(bad_ipaddrs, key=self.ssl_connection_bad_ipaddrs.get)[:window]
             addrs = good_ipaddrs + unkown_ipaddrs + bad_ipaddrs
+            remain_window = 3 * window - len(addrs)
+            if 0 < remain_window <= len(addresses):
+                addrs += random.sample(addresses, remain_window)
+            logging.debug('%s good_ipaddrs=%d, unkown_ipaddrs=%r, bad_ipaddrs=%r', cache_key, len(good_ipaddrs), len(unkown_ipaddrs),  len(bad_ipaddrs))
             queobj = gevent.queue.Queue() if gevent else Queue.Queue()
             for addr in addrs:
                 thread.start_new_thread(create_connection_withopenssl, (addr, timeout, queobj))
@@ -2046,16 +2066,46 @@ class Common(object):
         self.LOVE_ENABLE = self.CONFIG.getint('love', 'enable')
         self.LOVE_TIP = self.CONFIG.get('love', 'tip').encode('utf8').decode('unicode-escape').split('|')
 
-    def resolve_iplist(self):
-        def do_resolve(host, dnsservers, queue):
-            iplist = []
-            for dnslib_resolve in (dnslib_resolve_over_udp,):
+    def extend_iplist(self, iplist_name, hosts):
+        logging.info('extend_iplist start for hosts=%s', hosts)
+        new_iplist = []
+        def do_remote_resolve(host, dnsserver, queue):
+            assert isinstance(dnsserver, basestring)
+            for dnslib_resolve in (dnslib_resolve_over_udp, dnslib_resolve_over_tcp):
                 try:
-                    iplist += dnslib_record2iplist(dnslib_resolve_over_udp(host, dnsservers, timeout=4, blacklist=self.DNS_BLACKLIST))
+                    time.sleep(random.random())
+                    iplist = dnslib_record2iplist(dnslib_resolve(host, [dnsserver], timeout=4, blacklist=self.DNS_BLACKLIST))
+                    queue.put((host, dnsserver, iplist))
                 except (socket.error, OSError) as e:
-                    logging.warning('%r remote host=%r failed: %s', dnslib_resolve, host, e)
-            queue.put((host, dnsservers, iplist))
+                    logging.warning('%r remote host=%r failed: %s', dnslib_resolve.func_name, host, e)
+                    time.sleep(1)
+        result_queue = Queue.Queue()
+        for host in hosts:
+            for dnsserver in self.DNS_SERVERS:
+                logging.debug('remote resolve host=%r from dnsserver=%r', host, dnsserver)
+                thread.start_new_thread(do_remote_resolve, (host, dnsserver, result_queue))
+        for _ in xrange(len(self.DNS_SERVERS) * len(hosts) * 2):
+            try:
+                host, dnsserver, iplist = result_queue.get(timeout=16)
+                logging.debug('%r remote host=%r return %s', dnsserver, host, iplist)
+                if host.endswith('.google.com'):
+                    iplist = [x for x in iplist if is_google_ip(x)]
+                new_iplist += iplist
+            except Queue.Empty:
+                break
+        logging.info('extend_iplist finished, added %s', len(set(self.IPLIST_MAP[iplist_name])-set(new_iplist)))
+        self.IPLIST_MAP[iplist_name] = list(set(self.IPLIST_MAP[iplist_name] + new_iplist))
+
+    def resolve_iplist(self):
         # https://support.google.com/websearch/answer/186669?hl=zh-Hans
+        def do_local_resolve(host, queue):
+            assert isinstance(host, basestring)
+            for _ in xrange(3):
+                try:
+                    queue.put((host, socket.gethostbyname_ex(host)[-1]))
+                except (socket.error, OSError) as e:
+                    logging.warning('socket.gethostbyname_ex host=%r failed: %s', host, e)
+                    time.sleep(0.1)
         google_blacklist = ['216.239.32.20'] + list(self.DNS_BLACKLIST)
         for name, need_resolve_hosts in list(self.IPLIST_MAP.items()):
             if all(re.match(r'\d+\.\d+\.\d+\.\d+', x) or ':' in x for x in need_resolve_hosts):
@@ -2064,18 +2114,19 @@ class Common(object):
             resolved_iplist = [x for x in need_resolve_hosts if x not in need_resolve_remote]
             result_queue = Queue.Queue()
             for host in need_resolve_remote:
-                for dnsserver in self.DNS_SERVERS:
-                    logging.debug('resolve remote host=%r from dnsserver=%r', host, dnsserver)
-                    thread.start_new_thread(do_resolve, (host, [dnsserver], result_queue))
-            for _ in xrange(len(self.DNS_SERVERS) * len(need_resolve_remote)):
+                logging.debug('local resolve host=%r', host)
+                thread.start_new_thread(do_local_resolve, (host, result_queue))
+            for _ in xrange(len(need_resolve_remote)):
                 try:
-                    host, dnsservers, iplist = result_queue.get(timeout=10)
-                    resolved_iplist += iplist or []
-                    logging.debug('resolve remote host=%r from dnsservers=%s return iplist=%s', host, dnsservers, iplist)
+                    host, iplist = result_queue.get(timeout=8)
+                    if host.endswith('.google.com'):
+                        iplist = [x for x in iplist if is_google_ip(x)]
+                    resolved_iplist += iplist
                 except Queue.Empty:
-                    logging.warn('resolve remote timeout, try resolve local')
-                    resolved_iplist += sum([socket.gethostbyname_ex(x)[-1] for x in need_resolve_remote], [])
                     break
+            if name == 'google_hk':
+                for delay in (1, 60, 150, 240, 300, 450, 600, 900):
+                    spawn_later(delay, self.extend_iplist, name, need_resolve_remote)
             if name.startswith('google_') and name not in ('google_cn', 'google_hk') and resolved_iplist:
                 iplist_prefix = re.split(r'[\.:]', resolved_iplist[0])[0]
                 resolved_iplist = list(set(x for x in resolved_iplist if x.startswith(iplist_prefix)))
@@ -2176,39 +2227,6 @@ except ImportError:
             self.__x = x
             self.__y = y
             return ''.join(out)
-
-
-def read_random_bits(nbits):
-    '''Reads 'nbits' random bits.
-
-    If nbits isn't a whole number of bytes, an extra byte will be appended with
-    only the lower bits set.
-    '''
-
-    nbytes, rbits = divmod(nbits, 8)
-
-    # Get the random bytes
-    randomdata = os.urandom(nbytes)
-
-    # Add the remaining random bits
-    if rbits > 0:
-        randomvalue = ord(os.urandom(1))
-        randomvalue >>= (8 - rbits)
-        randomdata = byte(randomvalue) + randomdata
-    return randomdata
-
-def generate_RSA(bits=2048):
-    '''
-    Generate an RSA keypair with an exponent of 65537 in PEM format
-    param: bits The key length in bits
-    Return private key and public key
-    '''
-    from Crypto.PublicKey import RSA
-    new_key = RSA.generate(bits, e=65537)
-    public_key = new_key.publickey().exportKey("PEM")
-    private_key = new_key.exportKey("PEM")
-    print private_key
-    print public_key
 
 
 class XORCipher(object):
@@ -2457,22 +2475,16 @@ class GAEProxyHandler(AdvancedProxyHandler):
             logging.info('resolve common.IPLIST_MAP names=%s to iplist', list(common.IPLIST_MAP))
             common.resolve_iplist()
         random.shuffle(common.GAE_APPIDS)
-        for appid in common.GAE_APPIDS:
-            host = '%s.appspot.com' % appid
-            if host not in common.HOST_MAP:
-                common.HOST_MAP[host] = common.HOST_POSTFIX_MAP['.appspot.com']
-            if host not in self.dns_cache:
-                self.dns_cache[host] = common.IPLIST_MAP[common.HOST_MAP[host]]
-        if common.GAE_PAGESPEED:
-            for i in xrange(1, 10):
-                host = '%d-ps.googleusercontent.com' % i
-                if host not in common.HOST_MAP:
-                    common.HOST_MAP[host] = common.HOST_POSTFIX_MAP['.googleusercontent.com']
-                if host not in self.dns_cache:
-                    self.dns_cache[host] = common.IPLIST_MAP[common.HOST_MAP[host]]
+
+    def gethostbyname2(self, hostname):
+        for postfix in ('.appspot.com', '.googleusercontent.com'):
+            if hostname.endswith(postfix):
+                host = common.HOST_MAP.get(hostname) or common.HOST_POSTFIX_MAP[postfix]
+                return common.IPLIST_MAP.get(host) or host.split('|')
+        return AdvancedProxyHandler.gethostbyname2(self, hostname)
 
     def handle_urlfetch_error(self, fetchserver, response):
-        gae_appid = urlparse.urlsplit(fetchserver).netloc.split('.')[-3]
+        gae_appid = urlparse.urlsplit(fetchserver).hostname.split('.')[-3]
         if response.app_status == 503:
             # appid over qouta, switch to next appid
             if gae_appid == common.GAE_APPIDS[0] and len(common.GAE_APPIDS) > 1:
@@ -2504,7 +2516,7 @@ class PHPProxyHandler(AdvancedProxyHandler):
             self.handler_filters.insert(-1, HostsFilter())
         if not common.PROXY_ENABLE:
             common.resolve_iplist()
-            fetchhost = re.sub(r':\d+$', '', urlparse.urlsplit(common.PHP_FETCHSERVER).netloc)
+            fetchhost = urlparse.urlsplit(common.PHP_FETCHSERVER).hostname
             logging.info('resolve common.PHP_FETCHSERVER domain=%r to iplist', fetchhost)
             if common.PHP_USEHOSTS and fetchhost in common.HOST_MAP:
                 hostname = common.HOST_MAP[fetchhost]
@@ -2759,9 +2771,9 @@ class PacUtil(object):
                 elif line.startswith('||'):
                     domain = line[2:].lstrip('*').rstrip('/')
                 elif line.startswith('|'):
-                    domain = urlparse.urlsplit(line[1:]).netloc.lstrip('*')
+                    domain = urlparse.urlsplit(line[1:]).hostname.lstrip('*')
                 elif line.startswith(('http://', 'https://')):
-                    domain = urlparse.urlsplit(line).netloc.lstrip('*')
+                    domain = urlparse.urlsplit(line).hostname.lstrip('*')
                 elif re.search(r'^([\w\-\_\.]+)([\*\/]|$)', line):
                     domain = re.split(r'[\*\/]', line)[0]
                 else:
@@ -2993,8 +3005,8 @@ class PacFileFilter(BaseProxyHandlerFilter):
             with open(pacfile, 'rb') as fp:
                 content = fp.read()
                 if not is_local_client:
-                    listen_ip = ProxyUtil.get_listen_ip()
-                    content = content.replace('127.0.0.1', listen_ip)
+                    serving_addr = urlparts.hostname or ProxyUtil.get_listen_ip()
+                    content = content.replace('127.0.0.1', serving_addr)
                 headers = {'Content-Type': 'text/plain'}
                 if 'gzip' in handler.headers.get('Accept-Encoding', ''):
                     headers['Content-Encoding'] = 'gzip'
@@ -3173,6 +3185,9 @@ def pre_start():
         GAEProxyHandler.max_window = common.GAE_WINDOW
     if common.GAE_KEEPALIVE and common.GAE_MODE == 'https':
         GAEProxyHandler.ssl_connection_keepalive = True
+    if common.GAE_PAGESPEED and not common.GAE_OBFUSCATE:
+        logging.critical("*NOTE*, [gae]pagespeed=1 requires [gae]obfuscate=1")
+        sys.exit(-1)
     if common.GAE_SSLVERSION:
         GAEProxyHandler.ssl_version = getattr(ssl, 'PROTOCOL_%s' % common.GAE_SSLVERSION)
         GAEProxyHandler.openssl_context = SSLConnection.context_builder(common.GAE_SSLVERSION)
