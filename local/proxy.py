@@ -976,6 +976,7 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self.__class__.setup = BaseHTTPServer.BaseHTTPRequestHandler.setup
         self.__class__.do_CONNECT = self.__class__.do_METHOD
         self.__class__.do_GET = self.__class__.do_METHOD
+        self.__class__.do_PATCH = self.__class__.do_METHOD
         self.__class__.do_PUT = self.__class__.do_METHOD
         self.__class__.do_POST = self.__class__.do_METHOD
         self.__class__.do_HEAD = self.__class__.do_METHOD
@@ -2135,7 +2136,7 @@ class Common(object):
                 resolved_iplist = list(set(resolved_iplist))
             if name.startswith('google_'):
                 resolved_iplist = list(set(resolved_iplist) - set(google_blacklist))
-            if len(resolved_iplist) == 0:
+            if len(resolved_iplist) == 0 and name in ('google_hk', 'google_cn'):
                 logging.error('resolve %s host return empty! please retry!', name)
                 sys.exit(-1)
             logging.info('resolve name=%s host to iplist=%r', name, resolved_iplist)
