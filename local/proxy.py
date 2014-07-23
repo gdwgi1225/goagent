@@ -41,7 +41,7 @@
 #      v3aqb             <sgzz.cj@gmail.com>
 #      Oling Cat         <olingcat@gmail.com>
 
-__version__ = '3.1.18'
+__version__ = '3.1.19'
 
 import sys
 import os
@@ -2262,6 +2262,7 @@ class CipherFileObject(object):
 
 class LocalProxyServer(SocketServer.ThreadingTCPServer):
     """Local Proxy Server"""
+    request_queue_size = 256
     allow_reuse_address = True
     daemon_threads = True
 
