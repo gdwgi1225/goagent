@@ -85,8 +85,6 @@ import ConfigParser
 import urllib2
 
 import OpenSSL
-import dnslib
-import pygeoip
 
 NetWorkIOError = (socket.error, ssl.SSLError, OpenSSL.SSL.Error, OSError)
 
@@ -206,7 +204,7 @@ from proxylib import UserAgentFilter
 from proxylib import XORCipher
 
 
-def is_google_ip(ipaddr)::
+def is_google_ip(ipaddr):
     if ipaddr in ('74.125.127.102', '74.125.155.102', '74.125.39.102', '74.125.39.113', '209.85.229.138'):
         return False
     if ipaddr.startswith(('173.194.', '207.126.', '209.85.', '216.239.', '64.18.', '64.233.', '66.102.', '66.249.', '72.14.', '74.125.')):
@@ -625,6 +623,7 @@ class LocalfileFilter(BaseProxyHandlerFilter):
                 return 'mock', {'status': 200, 'headers': headers, 'body': data}
         except StandardError as e:
             return 'mock', {'status': 403, 'headers': {'Connection': 'close'}, 'body': 'read %r %r' % (filename, e)}
+
 
 class HostsFilter(BaseProxyHandlerFilter):
     """hosts filter"""
