@@ -1522,8 +1522,8 @@ class MultipleConnectionMixin(object):
     max_window = 4
     connect_timeout = 4
     max_timeout = 8
-    ssl_version = ssl.PROTOCOL_TLSv1
-    openssl_context = OpenSSL.SSL.Context(OpenSSL.SSL.TLSv1_METHOD)
+    ssl_version = ssl.PROTOCOL_SSLv23
+    openssl_context = OpenSSL.SSL.Context(OpenSSL.SSL.SSLv23_METHOD)
 
     def gethostbyname2(self, hostname):
         try:
@@ -1733,7 +1733,7 @@ class MultipleConnectionMixin(object):
                 # set a short timeout to trigger timeout retry more quickly.
                 sock.settimeout(timeout or self.connect_timeout)
                 # pick up the certificate
-                server_hostname = b'www.googleapis.com' if cache_key.startswith('google_') or hostname.endswith('.appspot.com') else None
+                server_hostname = b'www.googleapis.com' if (cache_key or '').startswith('google_') or hostname.endswith('.appspot.com') else None
                 ssl_sock = SSLConnection(self.openssl_context, sock)
                 ssl_sock.set_connect_state()
                 if server_hostname and hasattr(ssl_sock, 'set_tlsext_host_name'):
