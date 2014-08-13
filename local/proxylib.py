@@ -932,8 +932,6 @@ class StripPlugin(BaseFetchPlugin):
             except StandardError as e:
                 if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET):
                     logging.exception('ssl.wrap_socket(connection=%r) failed: %s', handler.connection, e)
-                handler.connection.shutdown(socket.SHUT_RDWR)
-                handler.connection.close()
                 return
             handler.connection = ssl_sock
             handler.rfile = handler.connection.makefile('rb', handler.bufsize)
@@ -950,8 +948,6 @@ class StripPlugin(BaseFetchPlugin):
                 return
             if not handler.raw_requestline:
                 handler.close_connection = 1
-                handler.connection.shutdown(socket.SHUT_RDWR)
-                handler.connection.close()
                 return
             if not handler.parse_request():
                 handler.send_error(400)
@@ -960,8 +956,6 @@ class StripPlugin(BaseFetchPlugin):
         except NetWorkIOError as e:
             if e.args[0] in (errno.ECONNABORTED, errno.ECONNRESET, errno.EPIPE):
                 handler.close_connection = 1
-                handler.connection.shutdown(socket.SHUT_RDWR)
-                handler.connection.close()
                 return
             else:
                 raise
@@ -1813,7 +1807,7 @@ class MultipleConnectionMixin(object):
         try:
             while cache_key:
                 ctime, sock = self.ssl_connection_cache[cache_key].get_nowait()
-                if time.time() - ctime < 30:
+                if time.time() - ctime < 16:
                     return sock
                 else:
                     sock.close()
