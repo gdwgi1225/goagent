@@ -443,7 +443,7 @@ class ProxyUtil(object):
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.connect(('8.8.8.8', 53))
             listen_ip = sock.getsockname()[0]
-        except socket.error:
+        except StandardError:
             pass
         finally:
             if sock:
@@ -1503,16 +1503,19 @@ class MultipleConnectionMixin(object):
     dns_blacklist = []
     tcp_connection_time = collections.defaultdict(float)
     tcp_connection_time_with_clienthello = collections.defaultdict(float)
+    tcp_connection_cache = collections.defaultdict(Queue.PriorityQueue)
+    tcp_connection_good_ipaddrs = {}
+    tcp_connection_bad_ipaddrs = {}
+    tcp_connection_unknown_ipaddrs = {}
+    tcp_connection_cachesock = False
+    tcp_connection_keepalive = False
     ssl_connection_time = collections.defaultdict(float)
+    ssl_connection_cache = collections.defaultdict(Queue.PriorityQueue)
     ssl_connection_good_ipaddrs = {}
     ssl_connection_bad_ipaddrs = {}
     ssl_connection_unknown_ipaddrs = {}
-    tcp_connection_cachesock = False
-    tcp_connection_keepalive = False
     ssl_connection_cachesock = False
     ssl_connection_keepalive = False
-    tcp_connection_cache = collections.defaultdict(Queue.PriorityQueue)
-    ssl_connection_cache = collections.defaultdict(Queue.PriorityQueue)
     max_window = 4
     connect_timeout = 4
     max_timeout = 8
@@ -1541,6 +1544,7 @@ class MultipleConnectionMixin(object):
         cache_key = kwargs.get('cache_key', '') if self.tcp_connection_cachesock and not client_hello else ''
         def create_connection(ipaddr, timeout, queobj):
             sock = None
+            sock = None
             try:
                 # create a ipv4/ipv6 socket object
                 sock = socket.socket(socket.AF_INET if ':' not in ipaddr[0] else socket.AF_INET6)
@@ -1550,7 +1554,7 @@ class MultipleConnectionMixin(object):
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
                 # resize socket recv buffer 8K->32K to improve browser releated application performance
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32*1024)
-                # disable nagle algorithm to send http request quickly.
+                # disable negal algorithm to send http request quickly.
                 sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, True)
                 # set a short timeout to trigger timeout retry more quickly.
                 sock.settimeout(min(self.connect_timeout, timeout))
@@ -1558,9 +1562,12 @@ class MultipleConnectionMixin(object):
                 start_time = time.time()
                 # TCP connect
                 sock.connect(ipaddr)
+                # end connection time record
+                connected_time = time.time()
                 # record TCP connection time
-                self.tcp_connection_time[ipaddr] = time.time() - start_time
-                # send client hello and peek server hello
+                self.tcp_connection_time[ipaddr] = sock.tcp_time = connected_time - start_time
+                if gevent and isinstance(sock, gevent.socket.socket):
+                    sock.tcp_time = connected_time - start_time
                 if client_hello:
                     sock.sendall(client_hello)
                     if gevent and isinstance(sock, gevent.socket.socket):
@@ -1572,16 +1579,26 @@ class MultipleConnectionMixin(object):
                         raise socket.timeout('timed out')
                     # record TCP connection time with client hello
                     self.tcp_connection_time_with_clienthello[ipaddr] = time.time() - start_time
-                # set timeout
-                sock.settimeout(timeout)
-                # put tcp socket object to output queobj
+                # remove from bad/unknown ipaddrs dict
+                self.tcp_connection_bad_ipaddrs.pop(ipaddr, None)
+                self.tcp_connection_unknown_ipaddrs.pop(ipaddr, None)
+                # add to good ipaddrs dict
+                if ipaddr not in self.tcp_connection_good_ipaddrs:
+                    self.tcp_connection_good_ipaddrs[ipaddr] = connected_time
+                # put ssl socket object to output queobj
                 queobj.put(sock)
-            except (socket.error, OSError) as e:
+            except (socket.error, ssl.SSLError, OSError) as e:
                 # any socket.error, put Excpetions to output queobj.
                 queobj.put(e)
                 # reset a large and random timeout to the ipaddr
-                self.tcp_connection_time[ipaddr] = self.connect_timeout+random.random()
-                # close tcp socket
+                self.tcp_connection_time[ipaddr] = self.connect_timeout + random.random()
+                # add to bad ipaddrs dict
+                if ipaddr not in self.tcp_connection_bad_ipaddrs:
+                    self.tcp_connection_bad_ipaddrs[ipaddr] = time.time()
+                # remove from good/unknown ipaddrs dict
+                self.tcp_connection_good_ipaddrs.pop(ipaddr, None)
+                self.tcp_connection_unknown_ipaddrs.pop(ipaddr, None)
+                # close ssl socket
                 if sock:
                     sock.close()
         def close_connection(count, queobj, first_tcp_time):
@@ -1589,8 +1606,7 @@ class MultipleConnectionMixin(object):
                 sock = queobj.get()
                 tcp_time_threshold = min(1, 1.3 * first_tcp_time)
                 if sock and not isinstance(sock, Exception):
-                    ipaddr = sock.getpeername()
-                    if cache_key and self.tcp_connection_time[ipaddr] < tcp_time_threshold:
+                    if cache_key and sock.tcp_time < tcp_time_threshold:
                         cache_queue = self.tcp_connection_cache[cache_key]
                         if cache_queue.qsize() < 8:
                             try:
@@ -1601,35 +1617,51 @@ class MultipleConnectionMixin(object):
                         cache_queue.put((time.time(), sock))
                     else:
                         sock.close()
+        def reorg_ipaddrs():
+            current_time = time.time()
+            for ipaddr, ctime in self.tcp_connection_good_ipaddrs.items():
+                if current_time - ctime > 4 * 60 and len(self.tcp_connection_good_ipaddrs) > 2 * self.max_window:
+                    self.tcp_connection_good_ipaddrs.pop(ipaddr, None)
+                    self.tcp_connection_unknown_ipaddrs[ipaddr] = ctime
+            for ipaddr, ctime in self.tcp_connection_bad_ipaddrs.items():
+                if current_time - ctime > 6 * 60:
+                    self.tcp_connection_bad_ipaddrs.pop(ipaddr, None)
+                    self.tcp_connection_unknown_ipaddrs[ipaddr] = ctime
+            logging.info("tcp good_ipaddrs=%d, bad_ipaddrs=%d, unknown_ipaddrs=%d", len(self.tcp_connection_good_ipaddrs), len(self.tcp_connection_bad_ipaddrs), len(self.tcp_connection_unknown_ipaddrs))
         try:
             while cache_key:
                 ctime, sock = self.tcp_connection_cache[cache_key].get_nowait()
-                if time.time() - ctime < 30:
+                if time.time() - ctime < 8:
                     return sock
                 else:
                     sock.close()
         except Queue.Empty:
             pass
         addresses = [(x, port) for x in self.gethostbyname2(hostname)]
+        #logging.info('gethostbyname2(%r) return %d addresses', hostname, len(addresses))
         sock = None
-        for _ in range(kwargs.get('max_retry', 3)):
-            window = min((self.max_window+1)//2, len(addresses))
-            if client_hello:
-                addresses.sort(key=self.tcp_connection_time_with_clienthello.__getitem__)
-            else:
-                addresses.sort(key=self.tcp_connection_time.__getitem__)
-            addrs = addresses[:window] + random.sample(addresses, window)
-            if 'gevent' in sys.modules:
-                queobj = __import__('gevent.queue', fromlist=['.']).Queue()
-            else:
-                queobj = Queue.Queue()
+        for i in range(kwargs.get('max_retry', 5)):
+            reorg_ipaddrs()
+            window = self.max_window + i
+            good_ipaddrs = [x for x in addresses if x in self.tcp_connection_good_ipaddrs]
+            good_ipaddrs = sorted(good_ipaddrs, key=self.tcp_connection_time.get)[:window]
+            unknown_ipaddrs = [x for x in addresses if x not in self.tcp_connection_good_ipaddrs and x not in self.tcp_connection_bad_ipaddrs]
+            random.shuffle(unknown_ipaddrs)
+            unknown_ipaddrs = unknown_ipaddrs[:window]
+            bad_ipaddrs = [x for x in addresses if x in self.tcp_connection_bad_ipaddrs]
+            bad_ipaddrs = sorted(bad_ipaddrs, key=self.tcp_connection_bad_ipaddrs.get)[:window]
+            addrs = good_ipaddrs + unknown_ipaddrs + bad_ipaddrs
+            remain_window = 3 * window - len(addrs)
+            if 0 < remain_window <= len(addresses):
+                addrs += random.sample(addresses, remain_window)
+            logging.debug('%s good_ipaddrs=%d, unknown_ipaddrs=%r, bad_ipaddrs=%r', cache_key, len(good_ipaddrs), len(unknown_ipaddrs), len(bad_ipaddrs))
+            queobj = Queue.Queue()
             for addr in addrs:
                 thread.start_new_thread(create_connection, (addr, timeout, queobj))
             for i in range(len(addrs)):
                 sock = queobj.get()
                 if not isinstance(sock, Exception):
-                    first_tcp_time = self.tcp_connection_time[sock.getpeername()] if not cache_key else 0
-                    thread.start_new_thread(close_connection, (len(addrs)-i-1, queobj, first_tcp_time))
+                    thread.start_new_thread(close_connection, (len(addrs)-i-1, queobj, getattr(sock, 'tcp_time') or self.tcp_connection_time[sock.getpeername()]))
                     return sock
                 elif i == 0:
                     # only output first error
@@ -1803,11 +1835,11 @@ class MultipleConnectionMixin(object):
                 if current_time - ctime > 6 * 60:
                     self.ssl_connection_bad_ipaddrs.pop(ipaddr, None)
                     self.ssl_connection_unknown_ipaddrs[ipaddr] = ctime
-            logging.info("good_ipaddrs=%d, bad_ipaddrs=%d, unkown_ipaddrs=%d", len(self.ssl_connection_good_ipaddrs), len(self.ssl_connection_bad_ipaddrs), len(self.ssl_connection_unknown_ipaddrs))
+            logging.info("ssl good_ipaddrs=%d, bad_ipaddrs=%d, unknown_ipaddrs=%d", len(self.ssl_connection_good_ipaddrs), len(self.ssl_connection_bad_ipaddrs), len(self.ssl_connection_unknown_ipaddrs))
         try:
             while cache_key:
                 ctime, sock = self.ssl_connection_cache[cache_key].get_nowait()
-                if time.time() - ctime < 16:
+                if time.time() - ctime < 8:
                     return sock
                 else:
                     sock.close()
@@ -1821,16 +1853,16 @@ class MultipleConnectionMixin(object):
             window = self.max_window + i
             good_ipaddrs = [x for x in addresses if x in self.ssl_connection_good_ipaddrs]
             good_ipaddrs = sorted(good_ipaddrs, key=self.ssl_connection_time.get)[:window]
-            unkown_ipaddrs = [x for x in addresses if x not in self.ssl_connection_good_ipaddrs and x not in self.ssl_connection_bad_ipaddrs]
-            random.shuffle(unkown_ipaddrs)
-            unkown_ipaddrs = unkown_ipaddrs[:window]
+            unknown_ipaddrs = [x for x in addresses if x not in self.ssl_connection_good_ipaddrs and x not in self.ssl_connection_bad_ipaddrs]
+            random.shuffle(unknown_ipaddrs)
+            unknown_ipaddrs = unknown_ipaddrs[:window]
             bad_ipaddrs = [x for x in addresses if x in self.ssl_connection_bad_ipaddrs]
             bad_ipaddrs = sorted(bad_ipaddrs, key=self.ssl_connection_bad_ipaddrs.get)[:window]
-            addrs = good_ipaddrs + unkown_ipaddrs + bad_ipaddrs
+            addrs = good_ipaddrs + unknown_ipaddrs + bad_ipaddrs
             remain_window = 3 * window - len(addrs)
             if 0 < remain_window <= len(addresses):
                 addrs += random.sample(addresses, remain_window)
-            logging.debug('%s good_ipaddrs=%d, unkown_ipaddrs=%r, bad_ipaddrs=%r', cache_key, len(good_ipaddrs), len(unkown_ipaddrs), len(bad_ipaddrs))
+            logging.debug('%s good_ipaddrs=%d, unknown_ipaddrs=%r, bad_ipaddrs=%r', cache_key, len(good_ipaddrs), len(unknown_ipaddrs), len(bad_ipaddrs))
             queobj = Queue.Queue()
             for addr in addrs:
                 thread.start_new_thread(create_connection_withopenssl, (addr, timeout, queobj))

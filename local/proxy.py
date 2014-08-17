@@ -611,7 +611,7 @@ class HostsFilter(BaseProxyHandlerFilter):
         elif hostname.endswith(self.host_postfix_endswith):
             hosts = next(self.host_postfix_map[x] for x in self.host_postfix_map if hostname.endswith(x))
         if hostport in self.hostport_map:
-            hosts = self.host_map[hostname]
+            hosts = self.hostport_map[hostport]
         elif hostport.endswith(self.hostport_postfix_endswith):
             hosts = next(self.hostport_postfix_map[x] for x in self.hostport_postfix_map if hostport.endswith(x))
         if handler.command != 'CONNECT' and self.urlre_map:
@@ -717,9 +717,6 @@ class PHPProxyHandler(MultipleConnectionMixin, SimpleProxyHandler):
 
     def __init__(self, *args, **kwargs):
         SimpleProxyHandler.__init__(self, *args, **kwargs)
-
-    def first_run(self):
-        self.__class__.handler_plugins['php'] = PHPFetchPlugin(common.PHP_FETCHSERVERS, common.PHP_PASSWORD, common.PHP_VALIDATE)
 
 
 class ProxyPHPProxyHandler(ProxyConnectionMixin, PHPProxyHandler):
@@ -1507,42 +1504,40 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     logging.basicConfig(level=logging.DEBUG if common.LISTEN_DEBUGINFO else logging.INFO, format='%(levelname)s - %(asctime)s %(message)s', datefmt='[%b %d %H:%M:%S]')
     pre_start()
-    if common.GAE_ENABLE:
-        CertUtil.check_ca()
     sys.stderr.write(common.info())
-    #uvent_enabled = 'uvent.loop' in sys.modules and isinstance(gevent.get_hub().loop, __import__('uvent').loop.UVLoop)
-    if common.PHP_ENABLE:
-        host, port = common.PHP_LISTEN.split(':')
-        HandlerClass = PHPProxyHandler if not common.PROXY_ENABLE else ProxyPHPProxyHandler
-        server = LocalProxyServer((host, int(port)), HandlerClass)
-        thread.start_new_thread(server.serve_forever, tuple())
 
     if common.PAC_ENABLE:
-        server = LocalProxyServer((common.PAC_IP, common.PAC_PORT), PACProxyHandler)
-        thread.start_new_thread(server.serve_forever, tuple())
+        thread.start_new_thread(LocalProxyServer((common.PAC_IP, common.PAC_PORT), PACProxyHandler).serve_forever, tuple())
 
     if common.DNS_ENABLE:
         try:
-            sys.path += ['.']
             from dnsproxy import DNSServer
             host, port = common.DNS_LISTEN.split(':')
-            server = DNSServer((host, int(port)), dns_servers=common.DNS_SERVERS, dns_blacklist=common.DNS_BLACKLIST, dns_tcpover=common.DNS_TCPOVER)
-            thread.start_new_thread(server.serve_forever, tuple())
+            dns_server = DNSServer((host, int(port)), dns_servers=common.DNS_SERVERS, dns_blacklist=common.DNS_BLACKLIST, dns_tcpover=common.DNS_TCPOVER)
+            thread.start_new_thread(dns_server.serve_forever, tuple())
         except ImportError:
             logging.exception('GoAgent DNSServer requires dnslib and gevent 1.0')
             sys.exit(-1)
 
     gevent.spawn(gfq.updateappid)
 
+    if common.GAE_ENABLE or common.PHP_ENABLE:
+        CertUtil.check_ca()
+
+    php_server = None
+    if common.PHP_ENABLE:
+        host, port = common.PHP_LISTEN.split(':')
+        HandlerClass = PHPProxyHandler if not common.PROXY_ENABLE else ProxyPHPProxyHandler
+        HandlerClass.handler_plugins['php'] = PHPFetchPlugin(common.PHP_FETCHSERVERS, common.PHP_PASSWORD, common.PHP_VALIDATE)
+        php_server = LocalProxyServer((host, int(port)), HandlerClass)
+        thread.start_new_thread(php_server.serve_forever, tuple())
+
     if common.GAE_ENABLE:
         HandlerClass = GAEProxyHandler if not common.PROXY_ENABLE else ProxyGAEProxyHandler
-        server = LocalProxyServer((common.LISTEN_IP, common.LISTEN_PORT), HandlerClass)
-        try:
-            server.serve_forever()
-        except SystemError as e:
-            if '(libev) select: ' in repr(e):
-                logging.error('PLEASE START GOAGENT BY uvent.bat')
-                sys.exit(-1)
+        if common.PHP_ENABLE:
+            HandlerClass.handler_plugins['php'] = php_server.RequestHandlerClass.handler_plugins['php']
+        gae_server = LocalProxyServer((common.LISTEN_IP, common.LISTEN_PORT), HandlerClass)
+        gae_server.serve_forever()
     else:
         gevent.sleep(sys.maxint)
 
