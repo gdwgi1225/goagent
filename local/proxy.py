@@ -185,7 +185,6 @@ from proxylib import get_dnsserver_list
 from proxylib import get_process_list
 from proxylib import get_uptime
 from proxylib import inflate
-from proxylib import JumpLastFilter
 from proxylib import LocalProxyServer
 from proxylib import message_html
 from proxylib import MockFetchPlugin
@@ -654,6 +653,30 @@ class GAEFetchFilter(BaseProxyHandlerFilter):
             else:
                 logging.warning('"%s %s" not supported by GAE, please enable PHP mode!', handler.command, handler.host)
                 return 'direct', {}
+
+
+class WithGAEFilter(BaseProxyHandlerFilter):
+    """force https filter"""
+    def __init__(self, withgae_sites, withphp_sites, withvps_sites):
+        self.withgae_sites = set(x for x in withgae_sites if not x.startswith('.'))
+        self.withgae_sites_postfix = tuple(x for x in withgae_sites if x.startswith('.'))
+        self.withphp_sites = set(x for x in withphp_sites if not x.startswith('.'))
+        self.withphp_sites_postfix = tuple(x for x in withphp_sites if x.startswith('.'))
+        self.withvps_sites = set(x for x in withvps_sites if not x.startswith('.'))
+        self.withvps_sites_postfix = tuple(x for x in withvps_sites if x.startswith('.'))
+
+    def filter(self, handler):
+        if handler.command == 'CONNECT':
+            do_ssl_handshake = 440 <= handler.port <= 450 or 1024 <= handler.port <= 65535
+            return 'strip', {'do_ssl_handshake': do_ssl_handshake}
+        elif handler.host in self.withgae_sites or handler.host.endswith(self.withgae_sites_postfix):
+            return 'gae', {}
+        elif handler.host in self.withphp_sites or handler.host.endswith(self.withphp_sites_postfix):
+            return 'php', {}
+        elif handler.host in self.withvps_sites or handler.host.endswith(self.withvps_sites_postfix):
+            return 'vps', {}
+        else:
+            pass
 
 
 class GAEProxyHandler(MultipleConnectionMixin, SimpleProxyHandler):
@@ -1158,6 +1181,8 @@ class Common(object):
         hostport_postfix_map = collections.OrderedDict()
         urlre_map = collections.OrderedDict()
         withgae_sites = []
+        withphp_sites = []
+        withvps_sites = []
         crlf_sites = []
         nocrlf_sites = []
         forcehttps_sites = []
@@ -1175,6 +1200,8 @@ class Common(object):
                 urlrewrite_map[site] = rule
                 continue
             for name, sites in [('withgae', withgae_sites),
+                                ('withphp', withphp_sites),
+                                ('withvps', withvps_sites),
                                 ('crlf', crlf_sites),
                                 ('nocrlf', nocrlf_sites),
                                 ('forcehttps', forcehttps_sites),
@@ -1201,7 +1228,9 @@ class Common(object):
                     host_map[site] = hostname
 
         self.HTTP_DNS = dns_servers
-        self.WITHGAE_SITES = set(withgae_sites)
+        self.WITHGAE_SITES = tuple(withgae_sites)
+        self.WITHPHP_SITES = tuple(withphp_sites)
+        self.WITHVPS_SITES = tuple(withvps_sites)
         self.CRLF_SITES = tuple(crlf_sites)
         self.NOCRLF_SITES = set(nocrlf_sites)
         self.FORCEHTTPS_SITES = tuple(forcehttps_sites)
@@ -1217,6 +1246,7 @@ class Common(object):
 
         self.IPLIST_MAP = collections.OrderedDict((k, v.split('|') if v else []) for k, v in self.CONFIG.items('iplist'))
         self.IPLIST_MAP.update((k, [k]) for k, v in self.HOST_MAP.items() if k == v)
+        self.IPLIST_PREDEFINED = [x for x in sum(self.IPLIST_MAP.values(), []) if re.match(r'^\d+\.\d+\.\d+\.\d+$', x) or ':' in x]
 
         self.PAC_ENABLE = self.CONFIG.getint('pac', 'enable')
         self.PAC_IP = self.CONFIG.get('pac', 'ip')
@@ -1428,6 +1458,8 @@ def pre_start():
         GAEProxyHandler.tcp_connection_keepalive = True
         GAEProxyHandler.ssl_connection_cachesock = True
         GAEProxyHandler.ssl_connection_keepalive = True
+    if common.IPLIST_PREDEFINED:
+        GAEProxyHandler.iplist_predefined = set(common.IPLIST_PREDEFINED)
     if common.GAE_PAGESPEED and not common.GAE_OBFUSCATE:
         logging.critical("*NOTE*, [gae]pagespeed=1 requires [gae]obfuscate=1")
         sys.exit(-1)
@@ -1473,8 +1505,8 @@ def pre_start():
         GAEProxyHandler.handler_filters.insert(0, FakeHttpsFilter(common.FAKEHTTPS_SITES, common.NOFAKEHTTPS_SITES))
     if common.FORCEHTTPS_SITES:
         GAEProxyHandler.handler_filters.insert(0, ForceHttpsFilter(common.FORCEHTTPS_SITES, common.NOFORCEHTTPS_SITES))
-    if common.WITHGAE_SITES:
-        GAEProxyHandler.handler_filters.insert(0, JumpLastFilter(common.WITHGAE_SITES))
+    if common.WITHGAE_SITES or common.WITHPHP_SITES or common.WITHVPS_SITES:
+        GAEProxyHandler.handler_filters.insert(0, WithGAEFilter(common.WITHGAE_SITES, common.WITHPHP_SITES, common.WITHVPS_SITES))
     if common.USERAGENT_ENABLE:
         GAEProxyHandler.handler_filters.insert(0, UserAgentFilter(common.USERAGENT_STRING))
     if common.LISTEN_USERNAME:

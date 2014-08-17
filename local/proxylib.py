@@ -552,8 +552,8 @@ def dnslib_resolve_over_udp(query, dnsservers, timeout, **kwargs):
                             logging.debug('qname=%r reply_server=%r record null iplist=%s', query.q.qname, reply_server, iplist)
                             continue
             except socket.error as e:
-                logging.warning('handle dns query=%s socket: %r', query.q.qname, e)
-        raise socket.gaierror(11004, 'getaddrinfo %r from %r failed' % (query.q.qname, dnsservers))
+                logging.warning('handle dns query=%s socket: %r', query, e)
+        raise socket.gaierror(11004, 'getaddrinfo %r from %r failed' % (query, dnsservers))
     finally:
         for sock in socks:
             sock.close()
@@ -604,12 +604,12 @@ def dnslib_resolve_over_tcp(query, dnsservers, timeout, **kwargs):
         try:
             result = queobj.get(timeout)
         except Queue.Empty:
-            raise socket.gaierror(11004, 'getaddrinfo %r from %r failed' % (query.q.qname, dnsservers))
+            raise socket.gaierror(11004, 'getaddrinfo %r from %r failed' % (query, dnsservers))
         if result and not isinstance(result, Exception):
             return result
         elif i == len(dnsservers) - 1:
-            logging.warning('dnslib_resolve_over_tcp %r with %s return %r', query.q.qname, dnsservers, result)
-    raise socket.gaierror(11004, 'getaddrinfo %r from %r failed' % (query.q.qname, dnsservers))
+            logging.warning('dnslib_resolve_over_tcp %r with %s return %r', query, dnsservers, result)
+    raise socket.gaierror(11004, 'getaddrinfo %r from %r failed' % (query, dnsservers))
 
 
 def dnslib_record2iplist(record):
@@ -1518,6 +1518,7 @@ class MultipleConnectionMixin(object):
     ssl_connection_unknown_ipaddrs = {}
     ssl_connection_cachesock = False
     ssl_connection_keepalive = False
+    iplist_predefined = set([])
     max_window = 4
     connect_timeout = 4
     max_timeout = 8
@@ -1622,7 +1623,7 @@ class MultipleConnectionMixin(object):
         def reorg_ipaddrs():
             current_time = time.time()
             for ipaddr, ctime in self.tcp_connection_good_ipaddrs.items():
-                if current_time - ctime > 4 * 60 and len(self.tcp_connection_good_ipaddrs) > 2 * self.max_window:
+                if current_time - ctime > 4 * 60 and len(self.tcp_connection_good_ipaddrs) > 2 * self.max_window and ipaddr[0] not in self.iplist_predefined:
                     self.tcp_connection_good_ipaddrs.pop(ipaddr, None)
                     self.tcp_connection_unknown_ipaddrs[ipaddr] = ctime
             for ipaddr, ctime in self.tcp_connection_bad_ipaddrs.items():
@@ -1830,7 +1831,7 @@ class MultipleConnectionMixin(object):
         def reorg_ipaddrs():
             current_time = time.time()
             for ipaddr, ctime in self.ssl_connection_good_ipaddrs.items():
-                if current_time - ctime > 4 * 60 and len(self.ssl_connection_good_ipaddrs) > 2 * self.max_window:
+                if current_time - ctime > 4 * 60 and len(self.ssl_connection_good_ipaddrs) > 2 * self.max_window and ipaddr[0] not in self.iplist_predefined:
                     self.ssl_connection_good_ipaddrs.pop(ipaddr, None)
                     self.ssl_connection_unknown_ipaddrs[ipaddr] = ctime
             for ipaddr, ctime in self.ssl_connection_bad_ipaddrs.items():
