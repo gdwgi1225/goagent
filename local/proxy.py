@@ -45,7 +45,7 @@
 #      Hubertzhang       <hubert.zyk@gmail.com>
 #      arrix             <arrixzhou@gmail.com>
 
-__version__ = '3.1.21'
+__version__ = '3.1.22'
 
 import sys
 import os
@@ -74,7 +74,6 @@ import io
 import traceback
 import random
 import base64
-import uuid
 import urlparse
 import threading
 import thread
@@ -496,7 +495,7 @@ class GAEFetchPlugin(BaseFetchPlugin):
         request_headers = {}
         if common.GAE_OBFUSCATE:
             request_method = 'GET'
-            fetchserver += '/ps/%s.gif' % uuid.uuid1()
+            fetchserver += '/ps/%d%s.gif' % (int(time.time()*1000), random.random())
             request_headers['X-GOA-PS1'] = base64.b64encode(deflate(metadata)).strip()
             if body:
                 request_headers['X-GOA-PS2'] = base64.b64encode(deflate(body)).strip()
@@ -1337,7 +1336,7 @@ class Common(object):
                 except Queue.Empty:
                     break
             if name == 'google_hk' and need_resolve_remote:
-                for delay in (1, 60, 150, 240, 300, 450, 600, 900):
+                for delay in (30, 60, 150, 240, 300, 450, 600, 900):
                     spawn_later(delay, self.extend_iplist, name, need_resolve_remote)
             if name.startswith('google_') and name not in ('google_cn', 'google_hk') and resolved_iplist:
                 iplist_prefix = re.split(r'[\.:]', resolved_iplist[0])[0]
