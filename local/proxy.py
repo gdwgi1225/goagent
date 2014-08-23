@@ -487,6 +487,7 @@ class GAEFetchPlugin(BaseFetchPlugin):
             kwargs['options'] = self.options
         if self.validate:
             kwargs['validate'] = self.validate
+        kwargs['fetchmaxsize'] = common.AUTORANGE_MAXSIZE
         metadata = 'G-Method:%s\nG-Url:%s\n%s' % (method, url, ''.join('G-%s:%s\n' % (k, v) for k, v in kwargs.items() if v))
         skip_headers = handler.skip_headers
         metadata += ''.join('%s:%s\n' % (k.title(), v) for k, v in headers.items() if k not in skip_headers)
@@ -589,6 +590,44 @@ class PHPFetchPlugin(BaseFetchPlugin):
                 break
             handler.wfile.write(data)
             del data
+
+
+class VPSFetchPlugin(BaseFetchPlugin):
+    """vps fetch plugin"""
+    connect_timeout = 4
+
+    def __init__(self, fetchservers, username, password):
+        BaseFetchPlugin.__init__(self)
+        self.fetchservers = fetchservers
+        self.username = username
+        self.password = password
+        self.fake_headers = {}
+
+    def handle(self, handler, **kwargs):
+        if handler.command == 'CONNECT':
+            return self.handle_connect(handler, **kwargs)
+        else:
+            return self.handle_method(handler, **kwargs)
+
+    def handle_connect(self, handler, **kwargs):
+        return
+
+    def handle_method(self, handler, **kwargs):
+        method = handler.command
+        url = handler.path
+        headers = dict((k.title(), v) for k, v in handler.headers.items() if k.title() not in handler.skip_headers)
+        x_headers = {}
+        if 'Host' in headers:
+            x_headers['Host'] = headers.pop('Host')
+        if 'Cookie' in headers:
+            x_headers['Cookie'] = headers.pop('Cookie')
+        headers['Host'] = 'www.%s.com' % self.username
+        self.fake_headers = headers.copy()
+        fetchserver = random.choice(self.fetchservers)
+        response = handler.create_http_request(handler.command, fetchserver, headers, handler.body, self.connect_timeout)
+        if not response:
+            raise socket.error(errno.ECONNRESET, 'urlfetch %r return None' % url)
+        #TODO
 
 
 class HostsFilter(BaseProxyHandlerFilter):
@@ -911,7 +950,7 @@ class PacUtil(object):
         return template % template_args
 
     @staticmethod
-    def urlfilter2pac(content, func_name='FindProxyForURLByUrlfilter', proxy='127.0.0.1:1999', default='DIRECT', indent=4):
+    def urlfilter2pac(content, func_name='FindProxyForURLByUrlfilter', proxy='127.0.0.1:1997', default='DIRECT', indent=4):
         """urlfilter.ini to Pac, based on https://github.com/iamamac/autoproxy2pac"""
         jsLines = []
         for line in content[content.index('[exclude]'):].splitlines()[1:]:
@@ -934,7 +973,7 @@ class PacUtil(object):
         return function
 
     @staticmethod
-    def adblock2pac(content, func_name='FindProxyForURLByAdblock', proxy='127.0.0.1:1999', default='DIRECT', admode=1, indent=4):
+    def adblock2pac(content, func_name='FindProxyForURLByAdblock', proxy='127.0.0.1:1997', default='DIRECT', admode=1, indent=4):
         """adblock list to Pac, based on https://github.com/iamamac/autoproxy2pac"""
         white_conditions = {'host': [], 'url.indexOf': [], 'shExpMatch': []}
         black_conditions = {'host': [], 'url.indexOf': [], 'shExpMatch': []}
