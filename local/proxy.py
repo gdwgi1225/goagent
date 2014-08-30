@@ -1433,11 +1433,17 @@ class Common(object):
                 resolved_iplist = list(set(resolved_iplist))
             if name.startswith('google_'):
                 resolved_iplist = list(set(resolved_iplist) - set(google_blacklist))
-            if len(resolved_iplist) == 0 and name in ('google_hk', 'google_cn'):
+            if len(resolved_iplist) == 0 and name in ('google_hk', 'google_cn') and self.GAE_PROFILE != 'ipv6':
                 logging.error('resolve %s host return empty! please retry!', name)
                 sys.exit(-1)
             logging.info('resolve name=%s host to iplist=%r', name, resolved_iplist)
             common.IPLIST_MAP[name] = resolved_iplist
+        if self.IPLIST_MAP.get('google_cn', []):
+            try:
+                for _ in xrange(4):
+                    socket.create_connection((random.choice(self.IPLIST_MAP['google_cn']), 80), timeout=2).close()
+            except socket.error:
+                self.IPLIST_MAP['google_cn'] = []
         if len(self.IPLIST_MAP.get('google_cn', [])) < 4 and self.IPLIST_MAP.get('google_hk', []):
             logging.warning('google_cn resolved too short iplist=%s, switch to google_hk', self.IPLIST_MAP.get('google_cn', []))
             self.IPLIST_MAP['google_cn'] = self.IPLIST_MAP['google_hk']
