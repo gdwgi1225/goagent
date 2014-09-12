@@ -355,7 +355,11 @@ class RangeFetch(object):
                             if self._stopped:
                                 response.close()
                                 return
-                            data = response.read(self.bufsize)
+                            data = None
+                            with gevent.Timeout(1, False):
+                                data = response.read(self.bufsize)
+                            if data is None:
+                                logging.warning('response.read(%r) timeout', self.bufsize)
                             if not data:
                                 break
                             data_queue.put((start, data))
@@ -454,7 +458,11 @@ class GAEFetchPlugin(BaseFetchPlugin):
             handler.end_headers()
             bufsize = 8192
             while True:
-                data = response.read(bufsize)
+                data = None
+                with gevent.Timeout(2, False):
+                    data = response.read(bufsize)
+                if data is None:
+                    logging.warning('response.read(%r) timeout', bufsize)
                 if data:
                     handler.wfile.write(data)
                 if not data:
@@ -1408,6 +1416,8 @@ class Common(object):
         google_blacklist = ['216.239.32.20'] + list(self.DNS_BLACKLIST)
         for name, need_resolve_hosts in list(self.IPLIST_MAP.items()):
             if all(re.match(r'\d+\.\d+\.\d+\.\d+', x) or ':' in x for x in need_resolve_hosts):
+                continue
+            if name.endswith('_ipv6') and common.GAE_PROFILE != 'ipv6':
                 continue
             need_resolve_remote = [x for x in need_resolve_hosts if ':' not in x and not re.match(r'\d+\.\d+\.\d+\.\d+', x)]
             resolved_iplist = [x for x in need_resolve_hosts if x not in need_resolve_remote]
