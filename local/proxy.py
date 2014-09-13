@@ -356,7 +356,7 @@ class RangeFetch(object):
                                 response.close()
                                 return
                             data = None
-                            with gevent.Timeout(1, False):
+                            with gevent.Timeout(max(1, self.bufsize//8192), False):
                                 data = response.read(self.bufsize)
                             if data is None:
                                 logging.warning('response.read(%r) timeout', self.bufsize)
@@ -364,7 +364,7 @@ class RangeFetch(object):
                                 break
                             data_queue.put((start, data))
                             start += len(data)
-                        except StandardError as e:
+                        except Exception as e:
                             logging.warning('RangeFetch "%s %s" %s failed: %s', self.handler.command, self.url, headers['Range'], e)
                             break
                     if start < end + 1:
