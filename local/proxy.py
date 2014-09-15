@@ -293,7 +293,7 @@ class RangeFetch(object):
                 self.handler.wfile.write(data)
                 self.expect_begin += len(data)
                 del data
-            except StandardError as e:
+            except Exception as e:
                 logging.info('RangeFetch client connection aborted(%s).', e)
                 break
         self._stopped = True
@@ -320,8 +320,8 @@ class RangeFetch(object):
                         response = self.plugin.fetch(self.handler, self.handler.command, self.url, headers, self.handler.body, timeout=self.handler.connect_timeout, fetchserver=fetchserver, **self.kwargs)
                 except Queue.Empty:
                     continue
-                except StandardError as e:
-                    logging.warning("Response %r in __fetchlet", e)
+                except Exception as e:
+                    logging.warning("RangeFetch fetch response %r in __fetchlet", e)
                     range_queue.put((start, end, None))
                     continue
                 if not response:
@@ -344,7 +344,7 @@ class RangeFetch(object):
                 if 200 <= response.status < 300:
                     content_range = response.getheader('Content-Range')
                     if not content_range:
-                        logging.warning('RangeFetch "%s %s" return Content-Range=%r: response headers=%r', self.handler.command, self.url, content_range, response.getheaders())
+                        logging.warning('RangeFetch "%s %s" return Content-Range=%r: response headers=%r, retry %s-%s', self.handler.command, self.url, content_range, response.getheaders(), start, end)
                         response.close()
                         range_queue.put((start, end, None))
                         continue
@@ -358,8 +358,6 @@ class RangeFetch(object):
                             data = None
                             with gevent.Timeout(max(1, self.bufsize//8192), False):
                                 data = response.read(self.bufsize)
-                            if data is None:
-                                logging.warning('response.read(%r) timeout', self.bufsize)
                             if not data:
                                 break
                             data_queue.put((start, data))
@@ -855,8 +853,21 @@ class PacUtil(object):
             need_update = False
             logging.exception('update_pacfile failed: %r', e)
         try:
-            logging.info('try download %r to update_pacfile(%r)', common.PAC_GFWLIST, filename)
-            autoproxy_content = base64.b64decode(opener.open(common.PAC_GFWLIST).read())
+            autoproxy_content_list = []
+            for url in common.PAC_GFWLIST.split('|'):
+                logging.info('try download %r to update_pacfile(%r)', url, filename)
+                if url.startswith('file://'):
+                    try:
+                        with open(url[len('file://'):], 'rb') as fp:
+                            autoproxy_content_list.append(fp.read())
+                    except IOError as e:
+                        logging.warning('PacUtil load %r failed: %r', url, e)
+                else:
+                    url_content = opener.open(url).read()
+                    if not any(x in url_content for x in '!-@|'):
+                        url_content = base64.b64decode(url_content)
+                    autoproxy_content_list.append(url_content)
+            autoproxy_content = '\n'.join(autoproxy_content_list)
             logging.info('%r downloaded, try convert it with autoproxy2pac_lite', common.PAC_GFWLIST)
             if 'gevent' in sys.modules and time.sleep is getattr(sys.modules['gevent'], 'sleep', None) and hasattr(gevent.get_hub(), 'threadpool'):
                 jsrule = gevent.get_hub().threadpool.apply_e(Exception, PacUtil.autoproxy2pac_lite, (autoproxy_content, 'FindProxyForURLByAutoProxy', autoproxy, default))
