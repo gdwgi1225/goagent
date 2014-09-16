@@ -1412,7 +1412,7 @@ class Common(object):
                     if self.GAE_IPV6:
                         iplist = [x for x in iplist if ':' in x]
                     else:
-                        iplist = [x for x in iplist if ':' not in x]
+                        iplist = [x for x in iplist if is_google_ip(x)]
                 new_iplist += iplist
             except Queue.Empty:
                 break
@@ -1447,7 +1447,7 @@ class Common(object):
                         if self.GAE_IPV6:
                             iplist = [x for x in iplist if ':' in x]
                         else:
-                            iplist = [x for x in iplist if is_google_ip(x)]
+                            iplist = [x for x in iplist if ':' not in x]
                     resolved_iplist += iplist
                 except Queue.Empty:
                     break
