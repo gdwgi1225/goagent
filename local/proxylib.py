@@ -370,7 +370,7 @@ class SSLConnection(object):
         return client, addr
 
     def do_handshake(self):
-        return self.__iowait(self._connection.do_handshake)
+        self.__iowait(self._connection.do_handshake)
 
     def connect(self, *args, **kwargs):
         return self.__iowait(self._connection.connect, *args, **kwargs)
@@ -959,12 +959,16 @@ class StripPlugin(BaseFetchPlugin):
         handler.end_headers()
         if do_ssl_handshake:
             try:
-                #certfile = CertUtil.get_cert(handler.host)
-                #ssl_sock = ssl.wrap_socket(handler.connection, keyfile=certfile, certfile=certfile, server_side=True)
-                ssl_sock = SSLConnection(self.get_ssl_context_by_hostname(handler.host), handler.connection)
-                ssl_sock.set_accept_state()
-                ssl_sock.do_handshake()
-            except StandardError as e:
+                certfile = CertUtil.get_cert(handler.host)
+                ssl_sock = ssl.wrap_socket(handler.connection, keyfile=certfile, certfile=certfile, server_side=True)
+                # ssl_sock = SSLConnection(self.get_ssl_context_by_hostname(handler.host), handler.connection)
+                # ssl_sock.set_accept_state()
+                # ssl_sock.do_handshake()
+            except OpenSSL.SSL.SysCallError as e:
+                if e[0] == -1 and 'Unexpected EOF' in e[1]:
+                    return
+                raise
+            except NetWorkError as e:
                 if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET):
                     logging.exception('ssl.wrap_socket(connection=%r) failed: %s', handler.connection, e)
                 return
@@ -1675,6 +1679,8 @@ class MultipleConnectionMixin(object):
         for i in range(kwargs.get('max_retry', 4)):
             reorg_ipaddrs()
             window = self.max_window + i
+            if len(self.ssl_connection_good_ipaddrs) > len(self.ssl_connection_bad_ipaddrs):
+                window = max(2, window-2)
             if len(self.tcp_connection_bad_ipaddrs)/2 >= len(self.tcp_connection_good_ipaddrs) <= 1.5 * window:
                 window += 2
             good_ipaddrs = [x for x in addresses if x in self.tcp_connection_good_ipaddrs]
@@ -1885,6 +1891,8 @@ class MultipleConnectionMixin(object):
         for i in range(kwargs.get('max_retry', 4)):
             reorg_ipaddrs()
             window = self.max_window + i
+            if len(self.ssl_connection_good_ipaddrs) > len(self.ssl_connection_bad_ipaddrs):
+                window = max(2, window-2)
             if len(self.ssl_connection_bad_ipaddrs)/2 >= len(self.ssl_connection_good_ipaddrs) <= 1.5 * window:
                 window += 2
             good_ipaddrs = [x for x in addresses if x in self.ssl_connection_good_ipaddrs]
@@ -1901,7 +1909,8 @@ class MultipleConnectionMixin(object):
             logging.debug('%s good_ipaddrs=%d, unknown_ipaddrs=%r, bad_ipaddrs=%r', cache_key, len(good_ipaddrs), len(unknown_ipaddrs), len(bad_ipaddrs))
             queobj = Queue.Queue()
             for addr in addrs:
-                thread.start_new_thread(create_connection_withopenssl, (addr, timeout, queobj))
+                #thread.start_new_thread(create_connection_withopenssl, (addr, timeout, queobj))
+                thread.start_new_thread(create_connection, (addr, timeout, queobj))
             for i in range(len(addrs)):
                 sock = queobj.get()
                 if not isinstance(sock, Exception):
