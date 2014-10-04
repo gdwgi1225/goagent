@@ -146,6 +146,7 @@ class CertUtil(object):
 
     ca_vendor = 'GoAgent'
     ca_keyfile = 'CA.crt'
+    ca_footprint = 'AB:70:2C:DF:18:EB:E8:B4:38:C5:28:69:CD:4A:5D:EF:48:B4:0E:33'
     ca_certdir = 'certs'
     ca_lock = threading.Lock()
 
@@ -184,6 +185,11 @@ class CertUtil(object):
             fp.write(OpenSSL.crypto.dump_privatekey(OpenSSL.crypto.FILETYPE_PEM, key))
 
     @staticmethod
+    def get_cert_serial_number(commonname):
+        saltname = '%s|%s' % (CertUtil.ca_footprint, commonname)
+        return int(hashlib.md5(saltname.encode('utf-8')).hexdigest(), 16)
+
+    @staticmethod
     def _get_cert(commonname, sans=()):
         with open(CertUtil.ca_keyfile, 'rb') as fp:
             content = fp.read()
@@ -214,10 +220,10 @@ class CertUtil(object):
         cert = OpenSSL.crypto.X509()
         cert.set_version(2)
         try:
-            cert.set_serial_number(int(hashlib.md5(commonname.encode('utf-8')).hexdigest(), 16))
+            cert.set_serial_number(CertUtil.get_cert_serial_number(commonname))
         except OpenSSL.SSL.Error:
             cert.set_serial_number(int(time.time()*1000))
-        cert.gmtime_adj_notBefore(0)
+        cert.gmtime_adj_notBefore(-600) #avoid crt time error warning
         cert.gmtime_adj_notAfter(60 * 60 * 24 * 3652)
         cert.set_issuer(ca.get_subject())
         cert.set_subject(req.get_subject())
@@ -253,15 +259,6 @@ class CertUtil(object):
     @staticmethod
     def import_ca(certfile):
         commonname = os.path.splitext(os.path.basename(certfile))[0]
-        sha1digest = 'AB:70:2C:DF:18:EB:E8:B4:38:C5:28:69:CD:4A:5D:EF:48:B4:0E:33'
-        if OpenSSL:
-            try:
-                with open(certfile, 'rb') as fp:
-                    x509 = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, fp.read())
-                    commonname = next(v.decode() for k, v in x509.get_subject().get_components() if k == b'O')
-                    sha1digest = x509.digest('sha1')
-            except StandardError as e:
-                logging.error('load_certificate(certfile=%r) failed:%s', certfile, e)
         if sys.platform.startswith('win'):
             import ctypes
             with open(certfile, 'rb') as fp:
@@ -274,15 +271,20 @@ class CertUtil(object):
                 store_handle = crypt32.CertOpenStore(10, 0, 0, 0x4000 | 0x20000, b'ROOT'.decode())
                 if not store_handle:
                     return -1
-                X509_ASN_ENCODING = 0x00000001
+                CERT_FIND_SUBJECT_STR = 0x00080007
                 CERT_FIND_HASH = 0x10000
+                X509_ASN_ENCODING = 0x00000001
                 class CRYPT_HASH_BLOB(ctypes.Structure):
                     _fields_ = [('cbData', ctypes.c_ulong), ('pbData', ctypes.c_char_p)]
-                crypt_hash = CRYPT_HASH_BLOB(20, binascii.a2b_hex(sha1digest.replace(':', '')))
+                crypt_hash = CRYPT_HASH_BLOB(20, binascii.a2b_hex(CertUtil.ca_footprint.replace(':', '')))
                 crypt_handle = crypt32.CertFindCertificateInStore(store_handle, X509_ASN_ENCODING, 0, CERT_FIND_HASH, ctypes.byref(crypt_hash), None)
                 if crypt_handle:
                     crypt32.CertFreeCertificateContext(crypt_handle)
                     return 0
+                # while True:
+                #     crypt_handle = crypt32.CertFindCertificateInStore(store_handle, X509_ASN_ENCODING, 0, CERT_FIND_SUBJECT_STR, CertUtil.ca_vendor, None)
+                #     if crypt_handle:
+                #         #TODO: delete it
                 ret = crypt32.CertAddEncodedCertificateToStore(store_handle, 0x1, certdata, len(certdata), 4, None)
                 crypt32.CertCloseStore(store_handle, 0)
                 del crypt32
@@ -309,23 +311,20 @@ class CertUtil(object):
         capath = os.path.join(os.path.dirname(os.path.abspath(__file__)), CertUtil.ca_keyfile)
         certdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), CertUtil.ca_certdir)
         if not os.path.exists(capath):
-            if not OpenSSL:
-                logging.critical('CA.key is not exist and OpenSSL is disabled, ABORT!')
-                sys.exit(-1)
             if os.path.exists(certdir):
-                if os.path.isdir(certdir):
-                    any(os.remove(x) for x in glob.glob(certdir+'/*.crt')+glob.glob(certdir+'/.*.crt'))
-                else:
-                    os.remove(certdir)
-                    os.mkdir(certdir)
+                any(os.remove(x) for x in glob.glob(certdir+'/*.crt')+glob.glob(certdir+'/.*.crt'))
             CertUtil.dump_ca()
-        if glob.glob('%s/*.key' % CertUtil.ca_certdir):
-            for filename in glob.glob('%s/*.key' % CertUtil.ca_certdir):
-                try:
-                    os.remove(filename)
-                    os.remove(os.path.splitext(filename)[0]+'.crt')
-                except EnvironmentError:
-                    pass
+        with open(capath, 'rb') as fp:
+            CertUtil.ca_footprint = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, fp.read()).digest('sha1')
+        #Check Certs
+        certfiles = glob.glob(certdir+'/*.crt')+glob.glob(certdir+'/.*.crt')
+        if certfiles:
+            filename = random.choice(certfiles)
+            commonname = os.path.splitext(os.path.basename(filename))[0]
+            with open(filename, 'rb') as fp:
+                serial_number = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, fp.read()).get_serial_number()
+            if serial_number != CertUtil.get_cert_serial_number(commonname):
+                any(os.remove(x) for x in certfiles)
         #Check CA imported
         if CertUtil.import_ca(capath) != 0:
             logging.warning('install root certificate failed, Please run as administrator/root/sudo')
@@ -336,6 +335,8 @@ class CertUtil(object):
 
 class SSLConnection(object):
     """OpenSSL Connection Wapper"""
+
+    handshaked_timeout = 5.0
 
     def __init__(self, context, sock):
         self._context = context
@@ -348,19 +349,23 @@ class SSLConnection(object):
             return getattr(self._connection, attr)
 
     def __iowait(self, io_func, *args, **kwargs):
-        timeout = self._sock.gettimeout() or 0.1
+        timeout = self._sock.fileno() or self.__class__.handshaked_timeout
         fd = self._sock.fileno()
         while True:
             try:
                 return io_func(*args, **kwargs)
             except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
                 sys.exc_clear()
-                _, _, errors = select.select([fd], [], [fd], timeout)
+                ins, _, errors = select.select([fd], [], [fd], timeout)
+                if not ins:
+                    raise socket.timeout('timed out')
                 if errors:
                     break
             except OpenSSL.SSL.WantWriteError:
                 sys.exc_clear()
-                _, _, errors = select.select([], [fd], [fd], timeout)
+                _, outs, errors = select.select([], [fd], [fd], timeout)
+                if not outs:
+                    raise socket.timeout('timed out')
                 if errors:
                     break
 
@@ -375,7 +380,7 @@ class SSLConnection(object):
     def connect(self, *args, **kwargs):
         return self.__iowait(self._connection.connect, *args, **kwargs)
 
-    def send(self, data, flags=0):
+    def __send(self, data, flags=0):
         try:
             return self.__iowait(self._connection.send, data, flags)
         except OpenSSL.SSL.SysCallError as e:
@@ -383,6 +388,13 @@ class SSLConnection(object):
                 # errors when writing empty strings are expected and can be ignored
                 return 0
             raise
+
+    def __send_memoryview(self, data, flags=0):
+        if hasattr(data, 'tobytes'):
+            data = data.tobytes()
+        return self.__send(data, flags)
+
+    send = __send if sys.version_info >= (2, 7, 5) else __send_memoryview
 
     def recv(self, bufsiz, flags=0):
         pending = self._connection.pending()
@@ -427,6 +439,32 @@ class SSLConnection(object):
             ssl_context.set_verify(OpenSSL.SSL.VERIFY_NONE, lambda c, x, e, d, ok: ok)
         ssl_context.set_cipher_list(':'.join(cipher_suites))
         return ssl_context
+
+
+def openssl_set_session_cache_mode(context, mode):
+    assert isinstance(context, OpenSSL.SSL.Context)
+    try:
+        import ctypes
+        SSL_CTRL_SET_SESS_CACHE_MODE = 44
+        SESS_CACHE_OFF = 0x0
+        SESS_CACHE_CLIENT = 0x1
+        SESS_CACHE_SERVER = 0x2
+        SESS_CACHE_BOTH = 0x3
+        c_mode = {'off':SESS_CACHE_OFF, 'client':SESS_CACHE_CLIENT, 'server':SESS_CACHE_SERVER, 'both':SESS_CACHE_BOTH}[mode.lower()]
+        if hasattr(context, 'set_session_cache_mode'):
+            context.set_session_cache_mode(c_mode)
+        elif OpenSSL.__version__ == '0.13':
+            # http://bazaar.launchpad.net/~exarkun/pyopenssl/release-0.13/view/head:/OpenSSL/ssl/context.h#L27
+            c_context = ctypes.c_void_p.from_address(id(context)+ctypes.sizeof(ctypes.c_int)+ctypes.sizeof(ctypes.c_voidp))
+            if os.name == 'nt':
+                # https://github.com/openssl/openssl/blob/92c78463720f71e47c251ffa58493e32cd793e13/ssl/ssl.h#L884
+                ctypes.c_int.from_address(c_context.value+ctypes.sizeof(ctypes.c_voidp)*7+ctypes.sizeof(ctypes.c_ulong)).value = c_mode
+            else:
+                import ctypes.util
+                # FIXME
+                # ctypes.cdll.LoadLibrary(ctypes.util.find_library('ssl')).SSL_CTX_ctrl(c_context, SSL_CTRL_SET_SESS_CACHE_MODE, c_mode, None)
+    except Exception as e:
+        logging.warning('openssl_set_session_cache_mode failed: %r', e)
 
 
 class ProxyUtil(object):
@@ -929,10 +967,11 @@ class MockFetchPlugin(BaseFetchPlugin):
 class StripPlugin(BaseFetchPlugin):
     """strip fetch plugin"""
 
-    def __init__(self, ssl_version='TLSv1', ciphers='ALL:!aNULL:!eNULL', cache_size=128):
+    def __init__(self, ssl_version='SSLv23', ciphers='ALL:!aNULL:!eNULL', cache_size=128, session_cache=True):
         self.ssl_method = getattr(OpenSSL.SSL, '%s_METHOD' % ssl_version)
         self.ciphers = ciphers
         self.ssl_context_cache = LRUCache(cache_size*2)
+        self.ssl_session_cache = session_cache
 
     def get_ssl_context_by_hostname(self, hostname):
         try:
@@ -950,6 +989,8 @@ class StripPlugin(BaseFetchPlugin):
             if self.ciphers:
                 context.set_cipher_list(self.ciphers)
             self.ssl_context_cache[hostname] = self.ssl_context_cache[certfile] = context
+            if self.ssl_session_cache:
+                openssl_set_session_cache_mode(context, 'server')
             return context
 
     def handle(self, handler, do_ssl_handshake=True):
@@ -1008,6 +1049,7 @@ class StripPlugin(BaseFetchPlugin):
 class DirectFetchPlugin(BaseFetchPlugin):
     """direct fetch plugin"""
     connect_timeout = 4
+    read_timeout = 16
     max_retry = 3
 
     def handle(self, handler, **kwargs):
@@ -1026,7 +1068,7 @@ class DirectFetchPlugin(BaseFetchPlugin):
         body = handler.body
         response = None
         try:
-            response = handler.create_http_request(method, url, headers, body, timeout=self.connect_timeout, **kwargs)
+            response = handler.create_http_request(method, url, headers, body, timeout=self.connect_timeout, read_timeout=self.read_timeout, **kwargs)
             logging.info('%s "DIRECT %s %s %s" %s %s', handler.address_string(), handler.command, url, handler.protocol_version, response.status, response.getheader('Content-Length', '-'))
             response_headers = dict((k.title(), v) for k, v in response.getheaders())
             handler.send_response(response.status)
@@ -1418,7 +1460,7 @@ class SimpleProxyHandler(BaseHTTPRequestHandler):
     handler_filters = [SimpleProxyHandlerFilter()]
     handler_plugins = {'direct': DirectFetchPlugin(),
                        'mock': MockFetchPlugin(),
-                       'strip': StripPlugin('SSLv23', 'RC4-SHA:!aNULL:!eNULL'),}
+                       'strip': StripPlugin(),}
 
     def finish(self):
         """make python2 BaseHTTPRequestHandler happy"""
@@ -1712,6 +1754,7 @@ class MultipleConnectionMixin(object):
     def create_ssl_connection(self, hostname, port, timeout, **kwargs):
         cache_key = kwargs.get('cache_key', '') if self.ssl_connection_cachesock else ''
         validate = kwargs.get('validate')
+        headfirst = kwargs.get('headfirst')
         def create_connection(ipaddr, timeout, queobj):
             sock = None
             ssl_sock = None
@@ -1755,14 +1798,29 @@ class MultipleConnectionMixin(object):
                 # add to good ipaddrs dict
                 if ipaddr not in self.ssl_connection_good_ipaddrs:
                     self.ssl_connection_good_ipaddrs[ipaddr] = handshaked_time
-                # verify SSL certificate.
-                if validate and hostname.endswith('.appspot.com'):
-                    cert = ssl_sock.getpeercert()
-                    orgname = next((v for ((k, v),) in cert['subject'] if k == 'organizationName'))
-                    if not orgname.lower().startswith('google '):
-                        raise ssl.SSLError("%r certificate organizationName(%r) not startswith 'Google'" % (hostname, orgname))
+                # verify SSL certificate issuer.
+                if validate and (hostname.endswith('.appspot.com') or '.google' in hostname):
+                    cert = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_ASN1, ssl_sock.getpeercert(True))
+                    issuer_commonname = next((v for k, v in cert.get_issuer().get_components() if k == 'CN'), '')
+                    if not issuer_commonname.startswith('Google'):
+                        raise socket.error('%r certficate is issued by %r, not Google' % (hostname, issuer_commonname))
                 # set timeout
                 ssl_sock.settimeout(timeout)
+                # do head first check
+                if headfirst:
+                    ssl_sock.send('HEAD /favicon.ico HTTP/1.1\r\nHost: %s\r\n\r\n' % hostname)
+                    response = httplib.HTTPResponse(ssl_sock, buffering=True)
+                    try:
+                        if gevent:
+                            with gevent.Timeout(timeout):
+                                response.begin()
+                        else:
+                            response.begin()
+                    except gevent.Timeout:
+                        ssl_sock.close()
+                        raise socket.timeout('timed out')
+                    finally:
+                        response.close()
                 # put ssl socket object to output queobj
                 queobj.put(ssl_sock)
             except (socket.error, ssl.SSLError, OSError) as e:
@@ -1824,12 +1882,27 @@ class MultipleConnectionMixin(object):
                 # add to good ipaddrs dict
                 if ipaddr not in self.ssl_connection_good_ipaddrs:
                     self.ssl_connection_good_ipaddrs[ipaddr] = handshaked_time
-                # verify SSL certificate.
+                # verify SSL certificate issuer.
                 if validate and (hostname.endswith('.appspot.com') or '.google' in hostname):
                     cert = ssl_sock.get_peer_certificate()
-                    commonname = next((v for k, v in cert.get_subject().get_components() if k == 'CN'))
-                    if '.google' not in commonname and not commonname.endswith('.appspot.com'):
-                        raise socket.error("Host name '%s' doesn't match certificate host '%s'" % (hostname, commonname))
+                    issuer_commonname = next((v for k, v in cert.get_issuer().get_components() if k == 'CN'), '')
+                    if not issuer_commonname.startswith('Google'):
+                        raise socket.error('%r certficate is issued by %r, not Google' % (hostname, issuer_commonname))
+                # do head first check
+                if headfirst:
+                    ssl_sock.send('HEAD /favicon.ico HTTP/1.1\r\nHost: %s\r\n\r\n' % hostname)
+                    response = httplib.HTTPResponse(ssl_sock, buffering=True)
+                    try:
+                        if gevent:
+                            with gevent.Timeout(timeout):
+                                response.begin()
+                        else:
+                            response.begin()
+                    except gevent.Timeout:
+                        ssl_sock.close()
+                        raise socket.timeout('timed out')
+                    finally:
+                        response.close()
                 # put ssl socket object to output queobj
                 queobj.put(ssl_sock)
             except (socket.error, OpenSSL.SSL.Error, OSError) as e:
@@ -1850,11 +1923,12 @@ class MultipleConnectionMixin(object):
                 if sock:
                     sock.close()
         def close_connection(count, queobj, first_tcp_time, first_ssl_time):
+            need_cache_count = 1
             for _ in range(count):
                 sock = queobj.get()
                 ssl_time_threshold = min(1, 1.3 * first_ssl_time)
                 if sock and not isinstance(sock, Exception):
-                    if cache_key and sock.ssl_time < ssl_time_threshold:
+                    if need_cache_count > 0 and cache_key and sock.ssl_time < ssl_time_threshold:
                         cache_queue = self.ssl_connection_cache[cache_key]
                         if cache_queue.qsize() < 8:
                             try:
@@ -1863,6 +1937,8 @@ class MultipleConnectionMixin(object):
                             except Queue.Empty:
                                 pass
                         cache_queue.put((time.time(), sock))
+                        if sock.getpeername()[0] not in self.iplist_predefined:
+                            need_cache_count -= 1
                     else:
                         sock.close()
         def reorg_ipaddrs():
@@ -1909,20 +1985,25 @@ class MultipleConnectionMixin(object):
             logging.debug('%s good_ipaddrs=%d, unknown_ipaddrs=%r, bad_ipaddrs=%r', cache_key, len(good_ipaddrs), len(unknown_ipaddrs), len(bad_ipaddrs))
             queobj = Queue.Queue()
             for addr in addrs:
-                thread.start_new_thread(create_connection_withopenssl, (addr, timeout, queobj))
-                #thread.start_new_thread(create_connection, (addr, timeout, queobj))
+                if sys.platform != 'darwin':
+                    thread.start_new_thread(create_connection_withopenssl, (addr, timeout, queobj))
+                else:
+                    # Workaround for CPU 100% issue under MacOSX
+                    thread.start_new_thread(create_connection, (addr, timeout, queobj))
+            errors = []
             for i in range(len(addrs)):
                 sock = queobj.get()
                 if not isinstance(sock, Exception):
                     thread.start_new_thread(close_connection, (len(addrs)-i-1, queobj, sock.tcp_time, sock.ssl_time))
                     return sock
-                elif i == 0:
-                    # only output first error
-                    logging.warning('create_ssl_connection to %r with %s return %r, try again.', hostname, addrs, sock)
+                else:
+                    errors.append(sock)
+                    if i == len(addrs) - 1:
+                        logging.warning('create_ssl_connection to %r with %s return %s, try again.', hostname, addrs, collections.OrderedDict.fromkeys(str(x) for x in errors).keys())
         if isinstance(sock, Exception):
             raise sock
 
-    def create_http_request(self, method, url, headers, body, timeout, max_retry=2, bufsize=8192, crlf=None, validate=None, cache_key=None, **kwargs):
+    def create_http_request(self, method, url, headers, body, timeout, max_retry=2, bufsize=8192, crlf=None, validate=None, cache_key=None, headfirst=False, **kwargs):
         scheme, netloc, path, query, _ = urlparse.urlsplit(url)
         if netloc.rfind(':') <= netloc.rfind(']'):
             # no port number
@@ -1941,7 +2022,7 @@ class MultipleConnectionMixin(object):
         for i in range(max_retry):
             try:
                 create_connection = self.create_ssl_connection if scheme == 'https' else self.create_tcp_connection
-                sock = create_connection(host, port, timeout, validate=validate, cache_key=cache_key)
+                sock = create_connection(host, port, timeout, validate=validate, cache_key=cache_key, headfirst=headfirst)
                 break
             except StandardError as e:
                 logging.exception('create_http_request "%s %s" failed:%s', method, url, e)
@@ -2009,8 +2090,18 @@ class MultipleConnectionMixin(object):
             response = httplib.HTTPResponse(sock)
             response.fp.close()
             response.fp = sock.makefile('rb')
-        sock.settimeout(self.connect_timeout)
-        response.begin()
+        if gevent and not headfirst and kwargs.get('read_timeout'):
+            try:
+                with gevent.Timeout(int(kwargs.get('read_timeout'))):
+                    response.begin()
+            except gevent.Timeout:
+                response.close()
+                raise socket.timeout('timed out')
+        else:
+            orig_timeout = sock.gettimeout()
+            sock.settimeout(self.connect_timeout)
+            response.begin()
+            sock.settimeout(orig_timeout)
         if ((scheme == 'https' and self.ssl_connection_cachesock and self.ssl_connection_keepalive) or (scheme == 'http' and self.tcp_connection_cachesock and self.tcp_connection_keepalive)) and cache_key:
             response.cache_key = cache_key
             response.cache_sock = response.fp._sock

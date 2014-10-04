@@ -45,7 +45,7 @@
 #      Hubertzhang       <hubert.zyk@gmail.com>
 #      arrix             <arrixzhou@gmail.com>
 
-__version__ = '3.1.25'
+__version__ = '3.2.0'
 
 import os
 import sys
@@ -188,6 +188,7 @@ from proxylib import LocalProxyServer
 from proxylib import message_html
 from proxylib import MockFetchPlugin
 from proxylib import MultipleConnectionMixin
+from proxylib import openssl_set_session_cache_mode
 from proxylib import ProxyConnectionMixin
 from proxylib import ProxyUtil
 from proxylib import RC4Cipher
@@ -413,7 +414,7 @@ class GAEFetchPlugin(BaseFetchPlugin):
         for i in xrange(self.max_retry):
             try:
                 response = self.fetch(handler, method, url, headers, body, self.connect_timeout)
-                if response.app_status < 400:
+                if response.app_status < 500:
                     break
                 else:
                     if response.app_status == 503:
@@ -425,7 +426,7 @@ class GAEFetchPlugin(BaseFetchPlugin):
                         self.appids.append(self.appids.pop(0))
                         logging.info('URLFETCH return %d, trying next appid=%r', response.app_status, self.appids[0])
                     response.close()
-            except StandardError as e:
+            except Exception as e:
                 errors.append(e)
                 logging.info('GAE "%s %s" appid=%r %r, retry...', handler.command, handler.path, self.appids[0], e)
         if len(errors) == self.max_retry:
@@ -473,7 +474,6 @@ class GAEFetchPlugin(BaseFetchPlugin):
                 return
 
     def fetch(self, handler, method, url, headers, body, timeout, **kwargs):
-        rc4crypt = lambda s, k: RC4Cipher(k).encrypt(s) if k else s
         if isinstance(body, basestring) and body:
             if len(body) < 10 * 1024 * 1024 and 'Content-Encoding' not in headers:
                 zbody = deflate(body)
@@ -493,9 +493,9 @@ class GAEFetchPlugin(BaseFetchPlugin):
             kwargs['validate'] = self.validate
         if self.maxsize:
             kwargs['maxsize'] = self.maxsize
-        metadata = 'G-Method:%s\nG-Url:%s\n%s' % (method, url, ''.join('G-%s:%s\n' % (k, v) for k, v in kwargs.items() if v))
-        skip_headers = handler.skip_headers
-        metadata += ''.join('%s:%s\n' % (k.title(), v) for k, v in headers.items() if k not in skip_headers)
+        payload = '%s %s %s\r\n' % (method, url, handler.request_version)
+        payload += ''.join('%s: %s\r\n' % (k, v) for k, v in headers.items() if k not in handler.skip_headers)
+        payload += ''.join('X-URLFETCH-%s: %s\r\n' % (k, v) for k, v in kwargs.items() if v)
         # prepare GAE request
         request_method = 'POST'
         fetchserver_index = random.randint(0, len(self.appids)-1) if 'Range' in headers else 0
@@ -503,50 +503,49 @@ class GAEFetchPlugin(BaseFetchPlugin):
         request_headers = {}
         if common.GAE_OBFUSCATE:
             request_method = 'GET'
-            fetchserver += '/ps/%d%s.gif' % (int(time.time()*1000), random.random())
-            request_headers['X-GOA-PS1'] = base64.b64encode(deflate(metadata)).strip()
+            fetchserver += 'ps/%d%s.gif' % (int(time.time()*1000), random.random())
+            request_headers['X-URLFETCH-PS1'] = base64.b64encode(deflate(payload)).strip()
             if body:
-                request_headers['X-GOA-PS2'] = base64.b64encode(deflate(body)).strip()
+                request_headers['X-URLFETCH-PS2'] = base64.b64encode(deflate(body)).strip()
                 body = ''
             if common.GAE_PAGESPEED:
                 fetchserver = re.sub(r'^(\w+://)', r'\g<1>1-ps.googleusercontent.com/h/', fetchserver)
         else:
-            metadata = deflate(metadata)
-            body = '%s%s%s' % (struct.pack('!h', len(metadata)), metadata, body)
+            payload = deflate(payload)
+            body = '%s%s%s' % (struct.pack('!h', len(payload)), payload, body)
             if 'rc4' in common.GAE_OPTIONS:
-                request_headers['X-GOA-Options'] = 'rc4'
-                body = rc4crypt(body, kwargs.get('password'))
+                request_headers['X-URLFETCH-Options'] = 'rc4'
+                body = RC4Cipher(kwargs.get('password')).encrypt(body)
             request_headers['Content-Length'] = str(len(body))
         # post data
         need_crlf = 0 if common.GAE_MODE == 'https' else 1
         need_validate = common.GAE_VALIDATE
         cache_key = '%s:%d' % (common.HOST_POSTFIX_MAP['.appspot.com'], 443 if common.GAE_MODE == 'https' else 80)
-        response = handler.create_http_request(request_method, fetchserver, request_headers, body, timeout, crlf=need_crlf, validate=need_validate, cache_key=cache_key)
+        headfirst = bool(common.GAE_HEADFIRST)
+        response = handler.create_http_request(request_method, fetchserver, request_headers, body, timeout, crlf=need_crlf, validate=need_validate, cache_key=cache_key, headfirst=headfirst)
         response.app_status = response.status
-        response.app_options = response.getheader('X-GOA-Options', '')
-        if response.status == 200 and response.msg.get('status'):
-            response.app_status = response.status = int(response.msg.get('status'))
         if response.app_status != 200:
             return response
-        data = response.read(4)
-        if len(data) < 4:
+        if 'rc4' in request_headers.get('X-URLFETCH-Options', ''):
+            response.fp = CipherFileObject(response.fp, RC4Cipher(kwargs['password']))
+        data = response.read(2)
+        if len(data) < 2:
             response.status = 502
             response.fp = io.BytesIO(b'connection aborted. too short leadbyte data=' + data)
             response.read = response.fp.read
             return response
-        response.status, headers_length = struct.unpack('!hh', data)
+        headers_length, = struct.unpack('!h', data)
         data = response.read(headers_length)
         if len(data) < headers_length:
             response.status = 502
             response.fp = io.BytesIO(b'connection aborted. too short headers data=' + data)
             response.read = response.fp.read
             return response
-        if 'rc4' not in response.app_options:
-            response.msg = httplib.HTTPMessage(io.BytesIO(inflate(data)))
-        else:
-            response.msg = httplib.HTTPMessage(io.BytesIO(inflate(rc4crypt(data, kwargs.get('password')))))
-            if kwargs.get('password') and response.fp:
-                response.fp = CipherFileObject(response.fp, RC4Cipher(kwargs['password']))
+        raw_response_line, headers_data = inflate(data).split('\r\n', 1)
+        _, response.status, response.reason = raw_response_line.split(None, 2)
+        response.status = int(response.status)
+        response.reason = response.reason.strip()
+        response.msg = httplib.HTTPMessage(io.BytesIO(headers_data))
         return response
 
 
@@ -576,16 +575,21 @@ class PHPFetchPlugin(BaseFetchPlugin):
             kwargs['password'] = self.password
         if self.validate:
             kwargs['validate'] = self.validate
-        metadata = 'G-Method:%s\nG-Url:%s\n%s%s' % (method, url, ''.join('G-%s:%s\n' % (k, v) for k, v in kwargs.items() if v), ''.join('%s:%s\n' % (k, v) for k, v in headers.items() if k not in skip_headers))
-        metadata = deflate(metadata)
-        app_body = b''.join((struct.pack('!h', len(metadata)), metadata, body))
-        app_headers = {'Content-Length': len(app_body), 'Content-Type': 'application/octet-stream'}
-        fetchserver = '%s?%s' % (self.fetchservers[0], random.random())
+        payload = '%s %s %s\r\n' % (method, url, handler.request_version)
+        payload += ''.join('%s: %s\r\n' % (k, v) for k, v in headers.items() if k not in handler.skip_headers)
+        payload += ''.join('X-URLFETCH-%s: %s\r\n' % (k, v) for k, v in kwargs.items() if v)
+        payload = deflate(payload)
+        body = '%s%s%s' % ((struct.pack('!h', len(payload)), payload, body))
+        request_headers = {'Content-Length': len(body), 'Content-Type': 'application/octet-stream'}
+        fetchserver_index = 0 if 'Range' not in headers else random.randint(0, len(self.fetchservers)-1)
+        fetchserver = '%s?%s' % (self.fetchservers[fetchserver_index], random.random())
         crlf = 0
         cache_key = '%s//:%s' % urlparse.urlsplit(fetchserver)[:2]
-        response = handler.create_http_request('POST', fetchserver, app_headers, app_body, self.connect_timeout, crlf=crlf, cache_key=cache_key)
-        if not response:
-            raise socket.error(errno.ECONNRESET, 'urlfetch %r return None' % url)
+        try:
+            response = handler.create_http_request('POST', fetchserver, request_headers, body, self.connect_timeout, crlf=crlf, cache_key=cache_key)
+        except Exception as e:
+            logging.warning('%s "%s" failed %r', method, url, e)
+            return
         response.app_status = response.status
         need_decrypt = self.password and response.app_status == 200 and response.getheader('Content-Type', '') == 'image/gif' and response.fp
         if need_decrypt:
@@ -673,18 +677,19 @@ class HostsFilter(BaseProxyHandlerFilter):
     def filter(self, handler):
         host, port = handler.host, handler.port
         hostport = handler.path if handler.command == 'CONNECT' else '%s:%d' % (host, port)
+        headfirst = '.google' in host
         if host in self.host_map:
-            return 'direct', {'cache_key': '%s:%d' % (self.host_map[host], port)}
+            return 'direct', {'cache_key': '%s:%d' % (self.host_map[host], port), 'headfirst': headfirst}
         elif host.endswith(self.host_postfix_endswith):
             self.host_map[host] = next(self.host_postfix_map[x] for x in self.host_postfix_map if host.endswith(x))
-            return 'direct', {'cache_key': '%s:%d' % (self.host_map[host], port)}
+            return 'direct', {'cache_key': '%s:%d' % (self.host_map[host], port), 'headfirst': headfirst}
         elif hostport in self.hostport_map:
-            return 'direct', {'cache_key': '%s:%d' % (self.hostport_map[hostport], port)}
+            return 'direct', {'cache_key': '%s:%d' % (self.hostport_map[hostport], port), 'headfirst': headfirst}
         elif hostport.endswith(self.hostport_postfix_endswith):
             self.hostport_map[hostport] = next(self.hostport_postfix_map[x] for x in self.hostport_postfix_map if hostport.endswith(x))
-            return 'direct', {'cache_key': '%s:%d' % (self.hostport_map[hostport], port)}
+            return 'direct', {'cache_key': '%s:%d' % (self.hostport_map[hostport], port), 'headfirst': headfirst}
         if handler.command != 'CONNECT' and self.urlre_map and any(x(handler.path) for x in self.urlre_map):
-            return 'direct', {}
+            return 'direct', {'headfirst': headfirst}
 
 
 class GAEFetchFilter(BaseProxyHandlerFilter):
@@ -737,7 +742,7 @@ class GAEProxyHandler(MultipleConnectionMixin, SimpleProxyHandler):
     handler_filters = [GAEFetchFilter()]
     handler_plugins = {'direct': DirectFetchPlugin(),
                        'mock': MockFetchPlugin(),
-                       'strip': StripPlugin('SSLv23', 'RC4-SHA:!aNULL:!eNULL'),}
+                       'strip': StripPlugin(),}
     hosts_filter = None
 
     def __init__(self, *args, **kwargs):
@@ -745,6 +750,7 @@ class GAEProxyHandler(MultipleConnectionMixin, SimpleProxyHandler):
 
     def first_run(self):
         """GAEProxyHandler setup, init domain/iplist map"""
+        openssl_set_session_cache_mode(self.openssl_context, 'client')
         if not common.PROXY_ENABLE:
             logging.info('resolve common.IPLIST_MAP names=%s to iplist', list(common.IPLIST_MAP))
             common.resolve_iplist()
@@ -794,7 +800,7 @@ class PHPProxyHandler(MultipleConnectionMixin, SimpleProxyHandler):
     handler_filters = [PHPFetchFilter()]
     handler_plugins = {'direct': DirectFetchPlugin(),
                        'mock': MockFetchPlugin(),
-                       'strip': StripPlugin('SSLv23', 'RC4-SHA:!aNULL:!eNULL'),}
+                       'strip': StripPlugin(),}
 
     def __init__(self, *args, **kwargs):
         SimpleProxyHandler.__init__(self, *args, **kwargs)
@@ -884,7 +890,7 @@ class PacUtil(object):
             logging.info('%r successfully updated', filename)
 
     @staticmethod
-    def autoproxy2pac(content, func_name='FindProxyForURLByAutoProxy', proxy='127.0.0.1:1998', default='DIRECT', indent=4):
+    def autoproxy2pac(content, func_name='FindProxyForURLByAutoProxy', proxy='127.0.0.1:8087', default='DIRECT', indent=4):
         """Autoproxy to Pac, based on https://github.com/iamamac/autoproxy2pac"""
         jsLines = []
         for line in content.splitlines()[1:]:
@@ -918,7 +924,7 @@ class PacUtil(object):
         return function
 
     @staticmethod
-    def autoproxy2pac_lite(content, func_name='FindProxyForURLByAutoProxy', proxy='127.0.0.1:1998', default='DIRECT', indent=4):
+    def autoproxy2pac_lite(content, func_name='FindProxyForURLByAutoProxy', proxy='127.0.0.1:8087', default='DIRECT', indent=4):
         """Autoproxy to Pac, based on https://github.com/iamamac/autoproxy2pac"""
         direct_domain_set = set([])
         proxy_domain_set = set([])
@@ -979,7 +985,7 @@ class PacUtil(object):
         return template % template_args
 
     @staticmethod
-    def urlfilter2pac(content, func_name='FindProxyForURLByUrlfilter', proxy='127.0.0.1:1997', default='DIRECT', indent=4):
+    def urlfilter2pac(content, func_name='FindProxyForURLByUrlfilter', proxy='127.0.0.1:8086', default='DIRECT', indent=4):
         """urlfilter.ini to Pac, based on https://github.com/iamamac/autoproxy2pac"""
         jsLines = []
         for line in content[content.index('[exclude]'):].splitlines()[1:]:
@@ -1002,7 +1008,7 @@ class PacUtil(object):
         return function
 
     @staticmethod
-    def adblock2pac(content, func_name='FindProxyForURLByAdblock', proxy='127.0.0.1:1997', default='DIRECT', admode=1, indent=4):
+    def adblock2pac(content, func_name='FindProxyForURLByAdblock', proxy='127.0.0.1:8086', default='DIRECT', admode=1, indent=4):
         """adblock list to Pac, based on https://github.com/iamamac/autoproxy2pac"""
         white_conditions = {'host': [], 'url.indexOf': [], 'shExpMatch': []}
         black_conditions = {'host': [], 'url.indexOf': [], 'shExpMatch': []}
@@ -1226,6 +1232,7 @@ class Common(object):
         self.GAE_WINDOW = self.CONFIG.getint('gae', 'window')
         self.GAE_KEEPALIVE = self.CONFIG.getint('gae', 'keepalive')
         self.GAE_CACHESOCK = self.CONFIG.getint('gae', 'cachesock')
+        self.GAE_HEADFIRST = self.CONFIG.getint('gae', 'headfirst')
         self.GAE_OBFUSCATE = self.CONFIG.getint('gae', 'obfuscate')
         self.GAE_VALIDATE = self.CONFIG.getint('gae', 'validate')
         self.GAE_TRANSPORT = self.CONFIG.getint('gae', 'transport') if self.CONFIG.has_option('gae', 'transport') else 0
@@ -1240,7 +1247,7 @@ class Common(object):
             try:
                 sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
                 sock.connect(('2001:4860:4860::8888', 53))
-                logging.info('use ipv6 interface %s for gae', sock.getpeername()[0])
+                logging.info('use ipv6 interface %s for gae', sock.getsockname()[0])
             except Exception as e:
                 logging.info('Fail try use ipv6 %r, fallback ipv4', e)
                 self.GAE_IPV6 = 0
@@ -1324,6 +1331,11 @@ class Common(object):
         self.IPLIST_MAP = collections.OrderedDict((k, v.split('|') if v else []) for k, v in self.CONFIG.items('iplist'))
         self.IPLIST_MAP.update((k, [k]) for k, v in self.HOST_MAP.items() if k == v)
         self.IPLIST_PREDEFINED = [x for x in sum(self.IPLIST_MAP.values(), []) if re.match(r'^\d+\.\d+\.\d+\.\d+$', x) or ':' in x]
+
+        if self.GAE_IPV6 and 'google_ipv6' in self.IPLIST_MAP:
+            for name in self.IPLIST_MAP.keys():
+                if name.startswith('google') and name not in ('google_ipv6', 'google_talk'):
+                    self.IPLIST_MAP[name] = self.IPLIST_MAP['google_ipv6']
 
         self.PAC_ENABLE = self.CONFIG.getint('pac', 'enable')
         self.PAC_IP = self.CONFIG.get('pac', 'ip')
@@ -1590,6 +1602,7 @@ def pre_start():
     RangeFetch.waitsize = common.AUTORANGE_WAITSIZE
     if True:
         GAEProxyHandler.handler_filters.insert(0, AutoRangeFilter(common.AUTORANGE_HOSTS, common.AUTORANGE_ENDSWITH, common.AUTORANGE_NOENDSWITH, common.AUTORANGE_MAXSIZE))
+        #PHPProxyHandler.handler_filters.insert(0, AutoRangeFilter(common.AUTORANGE_HOSTS, common.AUTORANGE_ENDSWITH, common.AUTORANGE_NOENDSWITH, common.AUTORANGE_MAXSIZE))
     if common.GAE_REGIONS:
         GAEProxyHandler.handler_filters.insert(0, DirectRegionFilter(common.GAE_REGIONS))
     if common.HOST_MAP or common.HOST_POSTFIX_MAP or common.HOSTPORT_MAP or common.HOSTPORT_POSTFIX_MAP or common.URLRE_MAP:
