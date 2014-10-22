@@ -5,33 +5,33 @@ page
 api
 *[gdwgi1225-goagent](http://gdwgi1225-hrd.appspot.com/api/gdwgi1225-goagent)
 
-## ¼òÒ×½Ì³Ì
+## ç®€æ˜“æ•™ç¨‹
 
-- ²¿Êğ
+- éƒ¨ç½²
 
-  1. ÉêÇë Google Appengine ²¢´´½¨ appid¡£
-  2. ÏÂÔØ goagent ×îĞÂ°æ https://github.com/goagent/goagent
-  3. ĞŞ¸Ä proxy.ini ÖĞµÄ [gae] ÏÂµÄ appid = ÄãµÄappid(¶àappidÇëÓÃ|¸ô¿ª)
-  4. ÔËĞĞ uploader.bat »ò uploader.py ¿ªÊ¼ÉÏ´«, ³É¹¦ºó¼´¿ÉÊ¹ÓÃÁË¡£
+  1. ç”³è¯· Google Appengine å¹¶åˆ›å»º appidã€‚
+  2. ä¸‹è½½ goagent æœ€æ–°ç‰ˆ https://github.com/goagent/goagent
+  3. ä¿®æ”¹ proxy.ini ä¸­çš„ [gae] ä¸‹çš„ appid = ä½ çš„appid(å¤šappidè¯·ç”¨|éš”å¼€)
+  4. è¿è¡Œ uploader.bat æˆ– uploader.py å¼€å§‹ä¸Šä¼ , æˆåŠŸåå³å¯ä½¿ç”¨äº†ã€‚
 
-- Ê¹ÓÃ
+- ä½¿ç”¨
 
-  * Windows ÓÃ»§ÍÆ¼öÊ¹ÓÃ goagent.exe ÍĞÅÌÍ¼±êÉèÖÃ IE ´úÀí(¶ÔÆäËüä¯ÀÀÆ÷Ò²ÓĞĞ§)¡£
-  * Chrome/Opera Çë°²×° [SwitchySharp](https://chrome.google.com/webstore/detail/dpplabbmogkhghncfbfdeeokoefdjegm) ²å¼ş£¨ÍÏ·Å  SwitchySharp.crx µ½À©Õ¹ÉèÖÃ£©£¬È»ºóµ¼Èë SwitchyOptions.bak
-  * Firefox Çë°²×° [FoxyProxy](https://addons.mozilla.org/zh-cn/firefox/addon/foxyproxy-standard/) £¬FirefoxĞèÒªµ¼ÈëÖ¤Êé£¬·½·¨Çë¼û FAQ
-  * ³öÏÖÁ¬½Ó²»ÉÏµÄÇé¿ö¿ÉÒÔ³¢ÊÔÊ¹ÓÃ [GoGo Tester](https://github.com/azzvx/gogotester/raw/master/GoGo%20Tester/bin/Debug/GoGo%20Tester.exe) ²âËÙ¡£
+  * Windows ç”¨æˆ·æ¨èä½¿ç”¨ goagent.exe æ‰˜ç›˜å›¾æ ‡è®¾ç½® IE ä»£ç†(å¯¹å…¶å®ƒæµè§ˆå™¨ä¹Ÿæœ‰æ•ˆ)ã€‚
+  * Chrome/Opera è¯·å®‰è£… [SwitchySharp](https://chrome.google.com/webstore/detail/dpplabbmogkhghncfbfdeeokoefdjegm) æ’ä»¶ï¼ˆæ‹–æ”¾  SwitchySharp.crx åˆ°æ‰©å±•è®¾ç½®ï¼‰ï¼Œç„¶åå¯¼å…¥ SwitchyOptions.bak
+  * Firefox è¯·å®‰è£… [FoxyProxy](https://addons.mozilla.org/zh-cn/firefox/addon/foxyproxy-standard/) ï¼ŒFirefoxéœ€è¦å¯¼å…¥è¯ä¹¦ï¼Œæ–¹æ³•è¯·è§ FAQ
+  * å‡ºç°è¿æ¥ä¸ä¸Šçš„æƒ…å†µå¯ä»¥å°è¯•ä½¿ç”¨ [GoGo Tester](https://github.com/azzvx/gogotester/raw/master/GoGo%20Tester/bin/Debug/GoGo%20Tester.exe) æµ‹é€Ÿã€‚
 
-## Í¼ÎÄ½Ì³Ì
+## å›¾æ–‡æ•™ç¨‹
 * https://github.com/goagent/goagent/blob/wiki/InstallGuide.md
 
-## ³£¼ûÎÊÌâ
+## å¸¸è§é—®é¢˜
 * https://github.com/goagent/goagent/blob/wiki/FAQ.md
 
-## ÅäÖÃ½éÉÜ
+## é…ç½®ä»‹ç»
 * https://github.com/goagent/goagent/blob/wiki/ConfigIntroduce.md
 
-## ¸üĞÂÀúÊ·
+## æ›´æ–°å†å²
 * https://github.com/goagent/goagent/blob/wiki/History.md
 
-## ÌÖÂÛÇø
+## è®¨è®ºåŒº
 * https://code.google.com/p/goagent/issues/list
