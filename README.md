@@ -1,9 +1,7 @@
 DON'T PANIC
 
-*page
-[gdwgi1225-goagent](http://gdwgi1225-hrd.appspot.com/page/gdwgi1225-goagent)
-*api
-[gdwgi1225-goagent](http://gdwgi1225-hrd.appspot.com/api/gdwgi1225-goagent)
+ *page[gdwgi1225-goagent](http://gdwgi1225-hrd.appspot.com/page/gdwgi1225-goagent)
+ *api[gdwgi1225-goagent](http://gdwgi1225-hrd.appspot.com/api/gdwgi1225-goagent)
 
 ## 简易教程
 
