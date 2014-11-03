@@ -68,10 +68,10 @@ def upload(dirname, appid):
     appcfg.main(['appcfg', 'update', dirname])
     with open(filename, 'wb') as fp:
         fp.write(yaml)
-    try:
-        os.remove(appengine_rpc.HttpRpcServer.DEFAULT_COOKIE_FILE_PATH)
-    except OSError:
-        pass
+    #try:
+    #    os.remove(appengine_rpc.HttpRpcServer.DEFAULT_COOKIE_FILE_PATH)
+    #except OSError:
+    #    pass
 
 
 def main():
