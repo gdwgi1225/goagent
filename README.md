@@ -19,6 +19,9 @@ DON'T PANIC
   * Firefox 请安装 [FoxyProxy](https://addons.mozilla.org/zh-cn/firefox/addon/foxyproxy-standard/) ，Firefox需要导入证书，方法请见 FAQ
   * 出现连接不上的情况可以尝试使用 [GoGo Tester](https://github.com/azzvx/gogotester/raw/master/GoGo%20Tester/bin/Debug/GoGo%20Tester.exe) 测速。
 
+## 最近更新
+* [1122 否] 3.2.3 正式版，修复 MacOSX/Linux 平台 CPU 100% 的问题；托盘图标支持设置ADSL拨号网络代理(注意：拨号网络请使用英文名称）。
+
 ## 讨论区
 * https://code.google.com/p/goagent/issues/list
 

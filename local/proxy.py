@@ -44,8 +44,16 @@
 #      zwhfly            <zwhfly@163.com>
 #      Hubertzhang       <hubert.zyk@gmail.com>
 #      arrix             <arrixzhou@gmail.com>
+#      gwjwin            <gwjwin@sina.com>
+#      Jobin             <1149225004@qq.com>
+#      Zhuhao Wang       <zhuhaow@gmail.com>
+#      YFdyh000          <yfdyh000@gmail.com>
+#      zzq1015           <zzq1015@users.noreply.github.com>
+#      Zhengfa Dang      <zfdang@users.noreply.github.com>
+#      haosdent          <haosdent@gmail.com>
+#      xk liu            <lxk1012@gmail.com>
 
-__version__ = '3.2.2'
+__version__ = '3.2.3'
 
 import os
 import sys
@@ -197,6 +205,7 @@ from proxylib import spawn_later
 from proxylib import SSLConnection
 from proxylib import StaticFileFilter
 from proxylib import StripPlugin
+from proxylib import URLRewriteFilter
 from proxylib import URLRewriteFilter
 from proxylib import UserAgentFilter
 from proxylib import XORCipher
@@ -384,7 +393,7 @@ class GAEFetchPlugin(BaseFetchPlugin):
     connect_timeout = 4
     max_retry = 2
 
-    def __init__(self, appids, password, path, mode, cachesock, keepalive, obfuscate, pagespeed, validate, options, maxsize):
+    def __init__(self, appids, password, path, mode, cachesock, keepalive, obfuscate, pagespeed, validate, options):
         BaseFetchPlugin.__init__(self)
         self.appids = appids
         self.password = password
@@ -396,10 +405,10 @@ class GAEFetchPlugin(BaseFetchPlugin):
         self.pagespeed = pagespeed
         self.validate = validate
         self.options = options
-        self.maxsize = maxsize
 
     def handle(self, handler, **kwargs):
         assert handler.command != 'CONNECT'
+        rescue_bytes = int(kwargs.pop('rescue_bytes', 0))
         method = handler.command
         headers = dict((k.title(), v) for k, v in handler.headers.items())
         body = handler.body
@@ -413,6 +422,8 @@ class GAEFetchPlugin(BaseFetchPlugin):
         response = None
         for i in xrange(self.max_retry):
             try:
+                if rescue_bytes:
+                    headers['Range'] = 'bytes=%d-' % rescue_bytes
                 response = self.fetch(handler, method, url, headers, body, self.connect_timeout)
                 if response.app_status < 500:
                     break
@@ -442,27 +453,32 @@ class GAEFetchPlugin(BaseFetchPlugin):
             return handler.handler_plugins['mock'].handle(handler, status, headers, content)
         logging.info('%s "GAE %s %s %s" %s %s', handler.address_string(), handler.command, handler.path, handler.protocol_version, response.status, response.getheader('Content-Length', '-'))
         try:
-            if response.status == 206:
+            if response.status == 206 and not rescue_bytes:
                 fetchservers = ['%s://%s.appspot.com%s' % (self.mode, x, self.path) for x in self.appids]
                 return RangeFetch(handler, self, response, fetchservers).fetch()
             handler.close_connection = not response.getheader('Content-Length')
-            handler.send_response(response.status)
-            for key, value in response.getheaders():
-                if key.title() == 'Transfer-Encoding':
-                    continue
-                handler.send_header(key, value)
-            handler.end_headers()
+            if not rescue_bytes:
+                handler.send_response(response.status)
+                for key, value in response.getheaders():
+                    if key.title() == 'Transfer-Encoding':
+                        continue
+                    handler.send_header(key, value)
+                handler.end_headers()
             bufsize = 8192
+            written = rescue_bytes
             while True:
                 data = None
                 with gevent.Timeout(self.connect_timeout, False):
                     data = response.read(bufsize)
                 if data is None:
-                    logging.warning('response.read(%r) %r timeout', bufsize, url)
+                    logging.warning('GAE response.read(%r) %r timeout', bufsize, url)
+                    if response.getheader('Accept-Ranges', '') == 'bytes' and not urlparse.urlparse(url).query:
+                        return self.handle(handler, rescue_bytes=written)
                     handler.close_connection = True
                     break
                 if data:
                     handler.wfile.write(data)
+                    written += len(data)
                 if not data:
                     cache_sock = getattr(response, 'cache_sock', None)
                     if cache_sock:
@@ -493,8 +509,6 @@ class GAEFetchPlugin(BaseFetchPlugin):
             kwargs['options'] = self.options
         if self.validate:
             kwargs['validate'] = self.validate
-        if self.maxsize:
-            kwargs['maxsize'] = self.maxsize
         payload = '%s %s %s\r\n' % (method, url, handler.request_version)
         payload += ''.join('%s: %s\r\n' % (k, v) for k, v in headers.items() if k not in handler.skip_headers)
         payload += ''.join('X-URLFETCH-%s: %s\r\n' % (k, v) for k, v in kwargs.items() if v)
@@ -757,7 +771,7 @@ class GAEProxyHandler(MultipleConnectionMixin, SimpleProxyHandler):
             logging.info('resolve common.IPLIST_MAP names=%s to iplist', list(common.IPLIST_MAP))
             common.resolve_iplist()
         random.shuffle(common.GAE_APPIDS)
-        self.__class__.handler_plugins['gae'] = GAEFetchPlugin(common.GAE_APPIDS, common.GAE_PASSWORD, common.GAE_PATH, common.GAE_MODE, common.GAE_CACHESOCK, common.GAE_KEEPALIVE, common.GAE_OBFUSCATE, common.GAE_PAGESPEED, common.GAE_VALIDATE, common.GAE_OPTIONS, common.GAE_MAXSIZE)
+        self.__class__.handler_plugins['gae'] = GAEFetchPlugin(common.GAE_APPIDS, common.GAE_PASSWORD, common.GAE_PATH, common.GAE_MODE, common.GAE_CACHESOCK, common.GAE_KEEPALIVE, common.GAE_OBFUSCATE, common.GAE_PAGESPEED, common.GAE_VALIDATE, common.GAE_OPTIONS)
         try:
             self.__class__.hosts_filter = next(x for x in self.__class__.handler_filters if isinstance(x, HostsFilter))
         except StopIteration:
@@ -1251,8 +1265,6 @@ class Common(object):
         self.GAE_REGIONS = set(x.upper() for x in self.CONFIG.get('gae', 'regions').split('|') if x.strip())
         self.GAE_SSLVERSION = self.CONFIG.get('gae', 'sslversion')
         self.GAE_PAGESPEED = self.CONFIG.getint('gae', 'pagespeed') if self.CONFIG.has_option('gae', 'pagespeed') else 0
-        self.GAE_MAXSIZE = self.CONFIG.getint('gae', 'maxsize')
-
         if self.GAE_IPV6:
             sock = None
             try:
@@ -1615,7 +1627,6 @@ def pre_start():
     RangeFetch.waitsize = common.AUTORANGE_WAITSIZE
     if True:
         GAEProxyHandler.handler_filters.insert(0, AutoRangeFilter(common.AUTORANGE_HOSTS, common.AUTORANGE_ENDSWITH, common.AUTORANGE_NOENDSWITH, common.AUTORANGE_MAXSIZE))
-        #PHPProxyHandler.handler_filters.insert(0, AutoRangeFilter(common.AUTORANGE_HOSTS, common.AUTORANGE_ENDSWITH, common.AUTORANGE_NOENDSWITH, common.AUTORANGE_MAXSIZE))
     if common.GAE_REGIONS:
         GAEProxyHandler.handler_filters.insert(0, DirectRegionFilter(common.GAE_REGIONS))
     if common.HOST_MAP or common.HOST_POSTFIX_MAP or common.HOSTPORT_MAP or common.HOSTPORT_POSTFIX_MAP or common.URLRE_MAP:
@@ -1690,6 +1701,8 @@ def main():
         HandlerClass = GAEProxyHandler if not common.PROXY_ENABLE else ProxyGAEProxyHandler
         if common.PHP_ENABLE:
             HandlerClass.handler_plugins['php'] = php_server.RequestHandlerClass.handler_plugins['php']
+        if os.name == 'nt':
+            HandlerClass.handler_plugins['strip'] = StripPluginEx()
         gae_server = LocalProxyServer((common.LISTEN_IP, common.LISTEN_PORT), HandlerClass)
         gae_server.serve_forever()
     else:
@@ -1697,5 +1710,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-﻿
